@@ -66,12 +66,21 @@ def build_levels(lower, upper, step):
 
 
 def simulate(df, levels, capital, verbose=False):
+    """
+    改进后的网格回测：
+    - 使用 open/high/low/close 三段内盘路径 (open->high, high->low, low->close)
+      来模拟同一根 K 线内可能跨越多个格位的先后执行顺序。
+    - 启动时会对 price 之上的格位执行初始化买入（保留你原意），但仓位记录和成本计算更明确。
+    - returns: trades, realized_pnl, final_equity, total_fees
+    """
+
     if not levels:
         return [], 0.0, capital, 0.0
 
+    # 每格分配资金（固定）
     per_grid_capital = capital / len(levels)
     cash = capital
-    open_positions = []
+    open_positions = []  # 每项: {"price": lv, "qty": qty, "cost": total_cost}
     bought_levels = set()
     trades = []
     realized_pnl = 0.0
@@ -79,12 +88,14 @@ def simulate(df, levels, capital, verbose=False):
     step = levels[1] - levels[0] if len(levels) > 1 else 0
 
     if verbose:
-        print("开始回测...")
+        print("回测开始...")
 
-    # --- 中位启动初始化 ---
+    # --- 初始化：对启动价格之上的格位全部买入（按你的需求保留） ---
     initial_price = df.iloc[0]['close']
     initial_ts = df.iloc[0]['datetime']
+    # 取所有大于初始价的格位（即期待价格上行时可以卖出）
     initial_buy_levels = [lv for lv in levels if lv > initial_price]
+    # 我们用市价 initial_price 购买，但仓位的关联价格仍标为 lv（便于卖出触发 lv+step）
     for lv in sorted(initial_buy_levels):
         if cash < per_grid_capital:
             break
@@ -100,55 +111,95 @@ def simulate(df, levels, capital, verbose=False):
         open_positions.append(new_position)
         bought_levels.add(lv)
         trades.append((initial_ts, "INIT_BUY", lv,
-                      f"Market buy at {initial_price:.2f}", cost_before_fee))
+                      f"market@{initial_price:.2f}", cost_before_fee))
 
-    # --- 主循环 ---
-    for i in range(1, len(df)):
-        lo, hi, ts = df.iloc[i]['low'], df.iloc[i]['high'], df.iloc[i]['datetime']
-        levels_sold_this_tick = set()
-        sellable_positions = [
-            p for p in open_positions if hi >= p['price'] + step]
-        if sellable_positions:
-            for position in sorted(sellable_positions, key=lambda p: p['price']):
-                if position in open_positions:  # 确保仓位未被之前的卖单处理
+    # --- 主循环：逐根 K 线，用三段内盘路径模拟 ---
+    for i in range(len(df)):
+        # 读取 bar 的 OHLC
+        # 若无 open 字段则用 close 代替（兼容）
+        o = float(df.iloc[i].get('open', df.iloc[i].get('close')))
+        h = float(df.iloc[i]['high'])
+        l = float(df.iloc[i]['low'])
+        c = float(df.iloc[i]['close'])
+        ts = df.iloc[i]['datetime']
+
+        # 记录本根 K 线已卖出的卖价（用来避免在同根 K 线后段立即以同价买回）
+        levels_sold_this_bar = set()
+
+        # 定义段序列： open -> high, high -> low, low -> close
+        segments = [(o, h), (h, l), (l, c)]
+
+        for seg_start, seg_end in segments:
+            if seg_start == seg_end:
+                continue
+
+            # 向上段 (price increasing)：先处理卖出（从低到高）
+            if seg_start < seg_end:
+                # 找出可以触发卖出的仓位（sell_price = buy_price + step）且在 (seg_start, seg_end]
+                # 我们先按 buy_price 升序处理（先处理低价仓位）
+                sell_candidates = sorted([p for p in open_positions if (p['price'] + step) > seg_start and (p['price'] + step) <= seg_end],
+                                         key=lambda p: p['price'])
+                for position in sell_candidates:
+                    if position not in open_positions:
+                        continue
                     buy_price = position['price']
-                    sell_price = buy_price + step
+                    sell_price = round(buy_price + step, 2)
                     proceeds = position['qty'] * sell_price
                     fee = proceeds * FEE_RATE
                     total_fees += fee
                     cash += (proceeds - fee)
                     realized_pnl += (proceeds - fee) - position['cost']
-                    levels_sold_this_tick.add(round(sell_price, 2))
+                    levels_sold_this_bar.add(sell_price)
                     trades.append(
-                        (ts, "SELL", round(sell_price, 2), buy_price, proceeds))
-                    open_positions.remove(position)
+                        (ts, "SELL", sell_price, buy_price, proceeds))
+                    # 移除仓位与标记
+                    try:
+                        open_positions.remove(position)
+                    except ValueError:
+                        pass
                     if buy_price in bought_levels:
                         bought_levels.remove(buy_price)
 
-        touched_levels = [lv for lv in levels if lo <= lv <= hi]
-        if touched_levels:
-            for lv in sorted(touched_levels, reverse=True):
-                if lv not in bought_levels and lv not in levels_sold_this_tick and cash >= per_grid_capital:
+            # 向下段 (price decreasing)：处理买入（从高到低）
+            else:  # seg_start > seg_end
+                # 找出该段范围内被触及的格位： (seg_end, seg_start]
+                touched = [lv for lv in levels if seg_end <= lv <= seg_start]
+                # 为模拟下行过程中先触及高位格，再触及低位格，按降序买入
+                for lv in sorted(touched, reverse=True):
+                    lv_rounded = round(lv, 2)
+                    # 如果该格位已被买过，跳过
+                    if lv_rounded in bought_levels:
+                        continue
+                    # 如果该格位对应的卖出价刚在本根 K 线被卖出（避免同根 K 线回购），跳过
+                    if (round(lv_rounded + step, 2)) in levels_sold_this_bar:
+                        continue
+                    # 资金是否足够
                     cost_before_fee = per_grid_capital
-                    qty = cost_before_fee / lv
                     fee = cost_before_fee * FEE_RATE
-                    total_fees += fee
                     total_cost = cost_before_fee + fee
                     if cash < total_cost:
+                        # 资金不足则无法继续买更低的格位（因为 per_grid_capital 固定且更低格位仍需相同资金）
                         continue
+                    qty = cost_before_fee / lv_rounded
+                    total_fees += fee
                     cash -= total_cost
-                    new_position = {"price": lv,
+                    new_position = {"price": lv_rounded,
                                     "qty": qty, "cost": total_cost}
                     open_positions.append(new_position)
-                    bought_levels.add(lv)
-                    trades.append((ts, "BUY", lv, None, cost_before_fee))
+                    bought_levels.add(lv_rounded)
+                    trades.append(
+                        (ts, "BUY", lv_rounded, None, cost_before_fee))
+
+        # 本根 K 线处理完毕，进入下一根
+
+    # 计算期末净值
+    final_equity = cash
+    last_close_price = float(df.iloc[-1]['close'])
+    for position in open_positions:
+        final_equity += position['qty'] * last_close_price
 
     if verbose:
         print("回测结束。")
-    final_equity = cash
-    last_close_price = df.iloc[-1]['close']
-    for position in open_positions:
-        final_equity += position['qty'] * last_close_price
 
     return trades, realized_pnl, final_equity, total_fees
 
