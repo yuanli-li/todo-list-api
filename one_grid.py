@@ -111,7 +111,7 @@ def simulate(df, levels, capital, verbose=False):
         open_positions.append(new_position)
         bought_levels.add(lv)
         trades.append((initial_ts, "INIT_BUY", lv,
-                      f"market@{initial_price:.2f}", cost_before_fee))
+                      f"market@{initial_price:.2f}", cost_before_fee, sorted(list(bought_levels))))
 
     # --- 主循环：逐根 K 线，用三段内盘路径模拟 ---
     for i in range(len(df)):
@@ -150,8 +150,6 @@ def simulate(df, levels, capital, verbose=False):
                     cash += (proceeds - fee)
                     realized_pnl += (proceeds - fee) - position['cost']
                     levels_sold_this_bar.add(sell_price)
-                    trades.append(
-                        (ts, "SELL", sell_price, buy_price, proceeds))
                     # 移除仓位与标记
                     try:
                         open_positions.remove(position)
@@ -159,6 +157,8 @@ def simulate(df, levels, capital, verbose=False):
                         pass
                     if buy_price in bought_levels:
                         bought_levels.remove(buy_price)
+                    trades.append(
+                        (ts, "SELL", sell_price, buy_price, proceeds, sorted(list(bought_levels))))
 
             # 向下段 (price decreasing)：处理买入（从高到低）
             else:  # seg_start > seg_end
@@ -188,7 +188,7 @@ def simulate(df, levels, capital, verbose=False):
                     open_positions.append(new_position)
                     bought_levels.add(lv_rounded)
                     trades.append(
-                        (ts, "BUY", lv_rounded, None, cost_before_fee))
+                        (ts, "BUY", lv_rounded, None, cost_before_fee, sorted(list(bought_levels))))
 
         # 本根 K 线处理完毕，进入下一根
 
@@ -223,7 +223,7 @@ if __name__ == "__main__":
         print("错误：未能获取K线数据，程序退出。")
     else:
         # 2. 定义要测试的步长范围和结果存储
-        step_range = range(20, 201, 5)
+        step_range = range(40, 201, 80)
         results_list = []
 
         # ==========================================================
@@ -244,7 +244,7 @@ if __name__ == "__main__":
 
                     # 4. 创建当前步长的交易明细 DataFrame
                     trade_df = pd.DataFrame(
-                        trades, columns=["time", "side", "price", "linked_buy_price", "amount_usdt"])
+                        trades, columns=["time", "side", "price", "linked_buy_price", "amount_usdt", "positions"])
 
                     # ==========================================================
                     # ===== 新增：将当前步长的交易明细写入其专属的工作表 =====
