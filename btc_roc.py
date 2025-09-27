@@ -81,23 +81,37 @@ def add_indicators(df, period=720):
 # ==============================================================================
 
 
-def build_levels(lower, upper, step):
+# ==============================================================================
+# 3. 策略配置模块 (已重构)
+# ==============================================================================
+
+def build_levels(lower, upper, n_grids):
     """
-    根据给定的上下限和步长，生成一个标准的网格线列表。
+    【方案A】根据给定的上下限和网格数量，生成一个标准的网格线列表。
+    步长是动态计算的。
+    :param n_grids: 您期望的网格数量 (e.g., 20)
     """
+    if lower >= upper or n_grids <= 0:
+        return [], 0  # 返回空的levels和一个step=0
+
+    # 动态计算步长
+    step = (upper - lower) / n_grids
+
     levels = []
     price = lower
-    while price <= upper:
+    # 使用 n_grids+1 来确保包含上限
+    for i in range(int(n_grids) + 1):
         levels.append(round(price, 2))
         price += step
-    return levels
+
+    return levels, step  # 【重要】同时返回生成的levels和计算出的step
 
 # ==============================================================================
 # 4. 回测引擎模块
 # ==============================================================================
 
 
-def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_period, verbose=False):
+def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_period, verbose=False):
     """
     动态网格（最终完美版）：
     - 【新增】在交易记录中加入了每一笔平仓交易的利润。
@@ -106,22 +120,27 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
 
     # --- 初始状态 ---
     lower, upper = initial_lower, initial_upper
-    levels = build_levels(lower, upper, step)
+    # 【核心修正 #1】调用新的 build_levels 并接收 step
+    levels, step = build_levels(lower, upper, n_grids)
     if not levels:
         return [], 0.0, capital, 0.0, 0
+
     lower, upper = levels[0], levels[-1]
     cash = capital
     open_positions, bought_levels, trades = [], set(), []
     realized_pnl, total_fees, shift_count = 0.0, 0.0, 0
     reference_ma, reference_ma_initialized = 0.0, False
+    # 【核心修正】引入“最高卖出水位线”
+    highest_sell_level_watermark = 0.0
 
     if verbose:
         print("回测开始...")
 
     # ===== 内部辅助函数 (execute_sell 已改造) =====
-    def execute_sell(position, sell_price, timestamp, levels_snapshot, close_price, side="SELL"):
-        nonlocal cash, realized_pnl, total_fees, trades, open_positions, bought_levels
-        proceeds = position["qty"] * sell_price
+    def execute_sell(position, sell_price, timestamp, levels_snapshot, close_price, side="SELL", modify_global_state=True):
+        nonlocal cash, realized_pnl, total_fees, trades, open_positions, bought_levels, highest_sell_level_watermark
+        trade_qty = position["qty"]   # 本次卖出的数量
+        proceeds = trade_qty * sell_price
         fee = proceeds * fee_rate
         total_fees += fee
         net_proceeds = proceeds - fee
@@ -131,16 +150,24 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
         single_profit = net_proceeds - position["cost"]
         realized_pnl += single_profit
 
-        try:
-            open_positions.remove(position)
-        except ValueError:
-            pass
-        bought_levels.discard(position["price"])
+        # === 是否修改全局仓位 ===
+        if modify_global_state:
+            try:
+                open_positions.remove(position)
+            except ValueError:
+                pass
+            bought_levels.discard(position["price"])
+
+            # 【核心修正】更新水位线
+        highest_sell_level_watermark = max(
+            highest_sell_level_watermark, sell_price)
 
         positions_snapshot = sorted([p['price'] for p in open_positions])
-        # 【修改】将 single_profit 加入交易记录
+        total_qty_snapshot = sum(p['qty'] for p in open_positions)
+        cash_snapshot = cash
+
         trades.append((timestamp, side, round(
-            sell_price, 2), position["price"], proceeds, single_profit, f"{lower:.2f}-{upper:.2f}", close_price, positions_snapshot, levels_snapshot))
+            sell_price, 2), position["price"],  position["avg_cost"], trade_qty, proceeds, cash_snapshot, total_qty_snapshot, single_profit, f"{lower:.2f}-{upper:.2f}", close_price, positions_snapshot, levels_snapshot))
 
         return True
 
@@ -157,14 +184,18 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
         cash -= total_cost
         total_fees += fee
         new_position = {"price": level_price,
-                        "qty": qty_to_buy, "cost": total_cost}
+                        "qty": qty_to_buy, "cost": total_cost, "avg_cost": total_cost / qty_to_buy if qty_to_buy > 0 else 0}
         if modify_global_state:
             open_positions.append(new_position)
             bought_levels.add(level_price)
+
         positions_snapshot = sorted([p['price'] for p in open_positions])
-        # 【修改】为买入交易的 profit 列填充 None
+        total_qty_snapshot = sum(p['qty'] for p in open_positions)
+        cash_snapshot = cash
+
+        # 为买入交易的 profit 列填充 None
         trades.append((timestamp, side, level_price,
-                      f"market@{buy_price:.2f}", cost_before_fee, None, f"{lower:.2f}-{upper:.2f}", close_price, positions_snapshot, levels_snapshot))
+                      f"market@{buy_price:.2f}", new_position["avg_cost"], qty_to_buy, cost_before_fee, cash_snapshot, total_qty_snapshot, None, f"{lower:.2f}-{upper:.2f}", close_price, positions_snapshot, levels_snapshot))
         return new_position
 
     def redistribute_positions(current_price, timestamp, old_levels_snapshot):
@@ -179,15 +210,14 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
         # === Step 1: 汇总资产 ===
         total_asset_value = cash + \
             sum(p['qty'] * current_price for p in open_positions)
-        if len(levels) == 0:
-            return
 
-        value_per_grid = total_asset_value / len(levels)  # 每格目标资金
+        effective_grids = max(len(levels), 1)  # 至少保证 1，避免除零
+        value_per_grid = total_asset_value / effective_grids  # 每格目标资金
         qty_per_grid = value_per_grid / current_price if current_price > 0 else 0
 
         if verbose:
             print(
-                f"    -> 总净值 {total_asset_value:.2f}, 每格目标资金 {value_per_grid:.2f}")
+                f"区间移动   -> 总净值 {total_asset_value:.2f}, 每格目标资金 {value_per_grid:.2f}")
 
         # === Step 2: 把遗留仓位打包成一个“库存池” ===
         survivors_pool = []
@@ -195,6 +225,7 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
             if p["qty"] > 1e-8:
                 survivors_pool.append({
                     "qty": p["qty"],
+                    "price": p["price"],
                     "avg_cost": p["cost"] / p["qty"] if p["qty"] > 0 else current_price
                 })
 
@@ -239,20 +270,29 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
                 (bought_position_part['cost'] if bought_position_part else 0)
 
             if final_qty > 1e-8:
+                final_avg_cost = final_cost / final_qty
                 new_positions.append(
-                    {"price": lv, "qty": final_qty, "cost": final_cost})
+                    {"price": lv, "qty": final_qty, "cost": final_cost, "avg_cost": final_avg_cost})
 
         # === Step 4: 卖掉剩余的遗留仓位 ===
         if survivors_pool:
             if verbose:
-                print(f"    -> 卖掉遗留 {len(survivors_pool)} 个仓位，换成现金")
+                print(f"区间移动   -> 卖掉遗留 {len(survivors_pool)} 个仓位，换成现金")
             for sp in survivors_pool:
-                leftover_value = sp["qty"] * current_price
-                fee = leftover_value * fee_rate
-                cash_gain = leftover_value - fee
-                cash += cash_gain
-                total_fees += fee
-                # 不更新 realized_pnl，因为相当于平仓
+                dummy_position = {
+                    "price": sp["price"],  # 最初的买入价
+                    "qty": sp["qty"],
+                    "cost": sp["qty"] * sp["avg_cost"],
+                    "avg_cost": sp["avg_cost"]  # <=== 保留原始成本
+                }
+                execute_sell(
+                    dummy_position,
+                    current_price,
+                    timestamp,
+                    old_levels_snapshot,
+                    current_price,
+                    side="REDIST_SELL_LEFTOVER"
+                )
 
         # === Step 5: 更新仓位 ===
         open_positions = new_positions
@@ -260,24 +300,49 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
 
     # 【您的核心贡献】将常规交易逻辑完全封装
     def process_bar_trades(o, h, l, c, ts):
-        nonlocal levels_sold_this_bar
-        value_per_grid_now = (
-            cash + sum(p['qty'] * c for p in open_positions)) / len(levels) if len(levels) > 0 else 0
+        nonlocal levels_sold_this_bar, bought_levels, open_positions, highest_sell_level_watermark, cash
+
+        # 动态分配资金（仅用于买入）
+        value_per_grid_now = cash / \
+            max(len([lv for lv in levels if lv < c]),
+                1) if len(levels) > 0 else 0
+
+        # 提前排序仓位，减少循环中的开销
+        sorted_positions = sorted(open_positions, key=lambda x: x['price'])
+
+        # 分段遍历价格路径
         segments = [(o, h), (h, l), (l, c)]
         for seg_start, seg_end in segments:
             if seg_start == seg_end:
                 continue
+
+            # ========= 上涨段：检查卖出 =========
             if seg_start < seg_end:
-                sell_candidates = sorted([p for p in open_positions if seg_start < (
-                    p['price'] + step) <= seg_end], key=lambda p: p['price'])
-                for p in sell_candidates:
-                    if p in open_positions:
-                        if execute_sell(p, p['price'] + step, ts, levels, c):
-                            levels_sold_this_bar.add(p['price'] + step)
+                for p in sorted_positions:
+                    if p not in open_positions:
+                        continue  # 可能已被卖出，跳过
+
+                    # --- 优先用 levels.index() 查找下一个格子 ---
+                    next_level = None
+                    try:
+                        idx = levels.index(p['price'])
+                        if idx + 1 < len(levels):
+                            next_level = levels[idx + 1]
+                    except ValueError:
+                        # --- fallback：用 min() 查找更大的格子 ---
+                        next_level = min(
+                            (lv for lv in levels if lv > p['price']), default=None)
+
+                    # 如果 next_level 被价格路径穿越 → 卖出
+                    if next_level and seg_start < next_level <= seg_end:
+                        if execute_sell(p, next_level, ts, levels, c):
+                            levels_sold_this_bar.add(next_level)
+
+            # ========= 下跌段：检查买入 =========
             else:
                 touched = [lv for lv in levels if seg_end <= lv < seg_start]
                 for lv in sorted(touched, reverse=True):
-                    if lv in bought_levels or lv in levels_sold_this_bar:
+                    if lv in bought_levels or lv in levels_sold_this_bar or lv >= highest_sell_level_watermark:
                         continue
                     execute_buy(lv, lv, value_per_grid_now,
                                 ts, levels, c, side="BUY")
@@ -286,8 +351,11 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
     per_grid_capital_init = capital / len(levels) if len(levels) > 0 else 0
     if per_grid_capital_init > 0 and not df.empty:
         init_price = df.iloc[0]['close']
+        highest_sell_level_watermark = init_price
+
         init_ts = df.iloc[0]['datetime']
-        init_levels = [lv for lv in levels if lv > init_price]
+        init_levels = [lv for lv in levels if lv >
+                       init_price]
         for lv in sorted(init_levels):
             execute_buy(lv, init_price, per_grid_capital_init,
                         init_ts, levels, init_price, side="INIT_BUY")
@@ -310,31 +378,30 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
 
         if reference_ma_initialized:
             ma_roc_from_ref = (current_ma - reference_ma) / reference_ma
-            if h > upper * (1 + breakout_buffer) and ma_roc_from_ref >= 0.01:
+            if h > upper * (1 + breakout_buffer) and ma_roc_from_ref >= 0.005:
                 shift_direction = "UP"
-            elif l < lower * (1 - breakout_buffer) and ma_roc_from_ref <= -0.01:
+            elif l < lower * (1 - breakout_buffer) and ma_roc_from_ref <= -0.005:
                 shift_direction = "DOWN"
 
         if shift_direction:
             old_levels = levels
             if shift_direction == "UP":
-                target_lower, target_upper = lower * 1.02, upper * 1.02
-                levels = build_levels(target_lower, target_upper, step)
-                if not levels:
-                    continue
-                lower, upper = levels[0], levels[-1]
-                if verbose:
-                    print(
-                        f"{ts} ▲ 网格上移并重分配: {old_levels[0]:.2f}-{old_levels[-1]:.2f} → {lower:.2f}-{upper:.2f}")
+                target_lower, target_upper = lower * 1.01, upper * 1.01
             else:  # SHIFT_DOWN
-                target_lower, target_upper = lower * 0.98, upper * 0.98
-                levels = build_levels(target_lower, target_upper, step)
-                if not levels:
-                    continue
-                lower, upper = levels[0], levels[-1]
-                if verbose:
-                    print(
-                        f"{ts} ▼ 网格下移并重分配: {old_levels[0]:.2f}-{old_levels[-1]:.2f} → {lower:.2f}-{upper:.2f}")
+                target_lower, target_upper = lower * 0.99, upper * 0.99
+
+            # 【核心修正 #2】每次移动时，都重新计算 levels 和 step
+            levels, step = build_levels(target_lower, target_upper, n_grids)
+
+            if not levels:
+                continue
+
+            lower, upper = levels[0], levels[-1]
+            if verbose:
+                print(
+                    f"{ts} ▼ 网格移动并重分配: {old_levels[0]:.2f}-{old_levels[-1]:.2f} → {lower:.2f}-{upper:.2f}")
+
+            highest_sell_level_watermark = c
 
             redistribute_positions(c, ts, old_levels)
             shift_count += 1
@@ -342,13 +409,17 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
 
             if boundary_changed:
                 reference_ma = current_ma
+                # some logs
                 positions_snapshot = sorted(
                     [p['price'] for p in open_positions])
+                total_qty_snapshot = sum(p['qty'] for p in open_positions)
+                cash_snapshot = cash
+
                 event_desc = "Grid Shifted & Redistributed"
                 actual_range_str = f"{levels[0]:.2f}-{levels[-1]:.2f}" if levels else "N/A"
                 # 【修改】为事件记录的 profit 列填充 None
-                trades.append((ts, f"SHIFT_{shift_direction}", actual_range_str,
-                              event_desc, None, None, f"{lower:.2f}-{upper:.2f}", c, positions_snapshot, levels))
+                trades.append((ts, f"SHIFT_{shift_direction}",
+                              event_desc, None, None, None, None, cash_snapshot, total_qty_snapshot, None, f"{lower:.2f}-{upper:.2f}", c, positions_snapshot, levels))
 
         # 【核心修正】将常规交易逻辑的调用放在这里
         levels_sold_this_bar = set()
@@ -357,7 +428,7 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
     # === 最终结算 ===
     final_equity = cash + sum(p['qty'] * df.iloc[-1]['close']
                               for p in open_positions)
-    return trades, realized_pnl, final_equity, total_fees, shift_count
+    return trades, realized_pnl, final_equity, total_fees, shift_count, open_positions
 
 
 # ==============================================================================
@@ -367,16 +438,16 @@ def simulate(df, initial_lower, initial_upper, step, capital, fee_rate, ma_perio
 if __name__ == "__main__":
     # ... (前面的 config 和数据加载部分无变动) ...
     config = {
-        "symbol": "BTCUSDT",
+        "symbol": "ETHUSDT",
         "start_date": "2025-06-07",
         "end_date": "2025-09-23",
         "interval": "1m",
         "ma_period": 720,
-        "capital": 2500,
+        "capital": 10000,
         "fee_rate": 0.00026,
-        "lower_bound": 95000,
-        "upper_bound": 112000,
-        "step_range": [630, 1060]
+        "lower_bound": 2200,
+        "upper_bound": 4000,
+        "grid_n_range": [15]
     }
 
     # --- 1. 数据预加载与处理 ---
@@ -389,6 +460,9 @@ if __name__ == "__main__":
     if os.path.exists(DATA_FILENAME):
         print(f"发现本地数据文件 '{DATA_FILENAME}'，正在加载...")
         df_full = pd.read_csv(DATA_FILENAME)
+        if 'datetime' not in df_full.columns:
+            raise ValueError(f"CSV 文件 {DATA_FILENAME} 格式错误，缺少 datetime 列")
+
         df_full['datetime'] = pd.to_datetime(df_full['datetime'])
         print("数据加载完毕！")
     else:
@@ -416,17 +490,17 @@ if __name__ == "__main__":
         output_filename = f"backtest_{config['symbol']}_full_report.xlsx"
         try:
             with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
-                total_steps = len(config["step_range"])
-                for i, step_value in enumerate(config["step_range"], 1):
+                total_grids = len(config["grid_n_range"])
+                for i, n_grids_value in enumerate(config["grid_n_range"], 1):
                     print(
-                        f"--- 正在测试步长 (STEP) = {step_value} ({i}/{total_steps}) ---")
+                        f"--- 正在测试网格数量 (N_GRIDS) = {n_grids_value} ({i}/{total_grids}) ---")
 
                     # 【核心修正 #1】增加一个变量 shift_count 来接收第5个返回值
-                    trades, realized, final_equity, total_fees, shift_count = simulate(
+                    trades, realized, final_equity, total_fees, shift_count, final_positions = simulate(
                         df_backtest,
                         config["lower_bound"],
                         config["upper_bound"],
-                        step_value,
+                        n_grids_value,  # <--- 传递网格数量
                         config["capital"],
                         config["fee_rate"],
                         config["ma_period"],
@@ -434,34 +508,41 @@ if __name__ == "__main__":
                     )
 
                     trade_df = pd.DataFrame(
-                        trades, columns=["time", "side", "level price", "linked_buy_price", "amount_usdt", "profit", "grid_range", "close_price", "positions", "levels_snapshot"])
-                    sheet_name = f"Step_{step_value}_Details"
+                        trades, columns=["time", "side", "level price", "linked_buy_price", "average cost", "trade_qty", "amount_usdt", "cash_balance", "total_qty", "profit", "grid_range", "close_price", "positions", "levels_snapshot"])
+                    sheet_name = f"Grid_{n_grids_value}_Details"
                     trade_df.to_excel(
                         writer, sheet_name=sheet_name, index=False)
                     print(f"    -> 交易明细已准备写入工作表: {sheet_name}")
 
                     total_pnl = final_equity - config["capital"]
                     unrealized_pnl = total_pnl - realized
+                    # 【核心修正 #2】使用更稳妥的方式计算最终持仓数
+                    current_positions = len(final_positions)
+
                     init_buy_trades_count = len(
                         trade_df[trade_df['side'] == 'INIT_BUY'])
                     buy_trades_count = len(trade_df[trade_df['side'].isin(
                         ['BUY', 'REBUILD_BUY', 'REDIST_BUY', 'REDIST_BUY_LOW'])])
                     sell_trades_count = len(
                         trade_df[trade_df['side'].str.contains('SELL')])
-                    current_positions = init_buy_trades_count + buy_trades_count - sell_trades_count
                     avg_profit_per_sell = realized / sell_trades_count if sell_trades_count > 0 else 0
 
                     # 【核心修正 #2】在总结报告中加入 shift_count
                     result_summary = {
-                        '步长(Step)': step_value, '总盈亏(%)': total_pnl / config["capital"] * 100,
-                        '已实现盈亏': realized, '未实现盈亏': unrealized_pnl,
-                        '卖出次数': sell_trades_count, '单次均利': avg_profit_per_sell,
-                        '当前持仓': current_positions, '总手续费': total_fees,
+                        '网格数量': n_grids_value,  # <--- 修改表头
+                        '总盈亏(%)': total_pnl / config["capital"] * 100,
+                        '已实现盈亏': realized,
+                        '未实现盈亏': unrealized_pnl,
+                        '卖出次数': sell_trades_count,
+                        '单次均利': avg_profit_per_sell,
+                        '当前持仓': current_positions,
+                        '总手续费': total_fees,
                         '移动次数': shift_count  # <--- 新增
                     }
                     results_list.append(result_summary)
 
-                results_df = pd.DataFrame(results_list).set_index('步长(Step)')
+                results_df = pd.DataFrame(
+                    results_list).set_index('网格数量')
                 results_df.sort_values(
                     by='总盈亏(%)', ascending=False, inplace=True)
                 results_df.to_excel(
@@ -469,10 +550,57 @@ if __name__ == "__main__":
                 print("\n--- 对比总结报告已准备写入工作表: Summary ---")
 
             print(f"\n✅ 完整回测报告已成功保存到文件: {output_filename}")
-            pd.options.display.float_format = '{:,.2f}'.format
-            print("\n" + "="*30 + " 不同步长参数回测对比报告 " + "="*30)
-            print(results_df.to_string())
-            print("=" * 82)
+            # ==========================================================
+            # ===== 【核心修正】在这里对 DataFrame 进行格式化，以便打印 =====
+            # ==========================================================
+
+            df_to_print = results_df.copy()
+
+            # 定义每一列的格式化规则
+            formatters = {
+                '总盈亏(%)':   "{:,.2f}".format,
+                '已实现盈亏':   "{:,.2f}".format,
+                '未实现盈亏':   "{:,.2f}".format,
+                '卖出次数':    "{:d}".format,
+                '单次均利':    "{:,.2f}".format,
+                '当前持仓':    "{:d}".format,
+                '总手续费':    "{:,.2f}".format,
+                '移动次数':    "{:d}".format
+            }
+
+            # 应用格式化
+            for col, formatter in formatters.items():
+                if col in df_to_print:
+                    df_to_print[col] = df_to_print[col].apply(formatter)
+
+            # 计算每列的最大宽度（表头 vs 内容）
+            col_widths = {}
+            for col in df_to_print.columns:
+                max_content_len = df_to_print[col].astype(str).map(len).max()
+                col_widths[col] = max(max_content_len, len(col))
+
+            # 格式化表头
+            header = "  ".join(
+                col.ljust(col_widths[col]) for col in df_to_print.columns)
+            index_name = df_to_print.index.name or ""
+            header = index_name.ljust(
+                len(str(df_to_print.index.max()))) + "  " + header
+
+            # 格式化行数据
+            rows = []
+            for idx, row in df_to_print.iterrows():
+                idx_str = str(idx).ljust(len(str(df_to_print.index.max())))
+                row_str = "  ".join(str(val).rjust(
+                    col_widths[col]) for col, val in row.items())
+                rows.append(idx_str + "  " + row_str)
+
+            # 打印结果
+            print("\n" + "="*30 + " 不同网格数量参数回测对比报告 " + "="*30)
+            print(header)
+            for r in rows:
+                print(r)
+            print("=" * len(header))
+
         except Exception as e:
             print(f"\n❌ 处理或保存文件时出错: {e}")
             traceback.print_exc()
