@@ -98,11 +98,8 @@ def build_levels(lower, upper, n_grids):
     step = (upper - lower) / n_grids
 
     levels = []
-    price = lower
     # 使用 n_grids+1 来确保包含上限
-    for i in range(int(n_grids) + 1):
-        levels.append(round(price, 2))
-        price += step
+    levels = [round(lower + step * i, 2) for i in range(int(n_grids) + 1)]
 
     return levels, step  # 【重要】同时返回生成的levels和计算出的step
 
@@ -226,7 +223,7 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
                 survivors_pool.append({
                     "qty": p["qty"],
                     "price": p["price"],
-                    "avg_cost": p["cost"] / p["qty"] if p["qty"] > 0 else current_price
+                    "avg_cost": p["avg_cost"] if p["qty"] > 0 else current_price
                 })
 
         survivors_pool.sort(key=lambda x: x["avg_cost"])  # 按成本低优先消耗
@@ -261,7 +258,7 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
                 value_to_invest = qty_needed * current_price
                 bought_position_part = execute_buy(
                     lv, current_price, value_to_invest, timestamp, levels,
-                    current_price, side="REDIST_BUY", modify_global_state=False
+                    current_price, side="REDIST_BUY_PART", modify_global_state=False
                 )
 
             final_qty = qty_from_survivors + \
@@ -280,7 +277,7 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
                 print(f"区间移动   -> 卖掉遗留 {len(survivors_pool)} 个仓位，换成现金")
             for sp in survivors_pool:
                 dummy_position = {
-                    "price": sp["price"],  # 最初的买入价
+                    "price": sp["price"],  # 遗留的网格
                     "qty": sp["qty"],
                     "cost": sp["qty"] * sp["avg_cost"],
                     "avg_cost": sp["avg_cost"]  # <=== 保留原始成本
@@ -354,7 +351,7 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
         highest_sell_level_watermark = init_price
 
         init_ts = df.iloc[0]['datetime']
-        init_levels = [lv for lv in levels if lv >
+        init_levels = [lv for lv in levels if lv >=
                        init_price]
         for lv in sorted(init_levels):
             execute_buy(lv, init_price, per_grid_capital_init,
@@ -365,18 +362,22 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
     ma_series, open_series, high_series, low_series, close_series, ts_series = df[ma_col_name].to_numpy(
     ), df['open'].to_numpy(), df['high'].to_numpy(), df['low'].to_numpy(), df['close'].to_numpy(), df['datetime'].to_numpy()
 
+    if not df.empty:
+        first_ma = df.iloc[0][ma_col_name]
+        first_close = df.iloc[0]['close']
+        reference_ma = first_ma if not pd.isna(first_ma) else first_close
+        reference_ma_initialized = True
+        if verbose:
+            print(
+                f"{df.iloc[0]['datetime']} 📌 初始 MA 参考点设为: {reference_ma:.2f}")
     for i in range(1, len(df)):
         o, h, l, c, ts = open_series[i], high_series[i], low_series[i], close_series[i], ts_series[i]
 
         current_ma = ma_series[i]
-        if not reference_ma_initialized and not pd.isna(current_ma):
-            reference_ma, reference_ma_initialized = current_ma, True
-            if verbose:
-                print(f"{ts} 📈 MA 参考点已初始化: {reference_ma:.2f}")
 
         breakout_buffer, boundary_changed, shift_direction = 0.01, False, None
 
-        if reference_ma_initialized:
+        if reference_ma is not None and not pd.isna(current_ma):
             ma_roc_from_ref = (current_ma - reference_ma) / reference_ma
             if h > upper * (1 + breakout_buffer) and ma_roc_from_ref >= 0.005:
                 shift_direction = "UP"
@@ -419,7 +420,7 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
                 actual_range_str = f"{levels[0]:.2f}-{levels[-1]:.2f}" if levels else "N/A"
                 # 【修改】为事件记录的 profit 列填充 None
                 trades.append((ts, f"SHIFT_{shift_direction}",
-                              event_desc, None, None, None, None, cash_snapshot, total_qty_snapshot, None, f"{lower:.2f}-{upper:.2f}", c, positions_snapshot, levels))
+                              event_desc, None, None, None, None, cash_snapshot, total_qty_snapshot, None, actual_range_str, c, positions_snapshot, levels))
 
         # 【核心修正】将常规交易逻辑的调用放在这里
         levels_sold_this_bar = set()
@@ -447,7 +448,7 @@ if __name__ == "__main__":
         "fee_rate": 0.00026,
         "lower_bound": 2200,
         "upper_bound": 4000,
-        "grid_n_range": [15]
+        "grid_n_range": [72]
     }
 
     # --- 1. 数据预加载与处理 ---
