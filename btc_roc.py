@@ -1,8 +1,33 @@
+import sqlite3
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import os
 import traceback
+
+
+class GridTrader:
+    def __init__(self, capital, fee_rate, n_grids, lower, upper):
+        # 初始资金与参数
+        self.cash = capital
+        self.fee_rate = fee_rate
+        self.n_grids = n_grids
+        self.lower = lower
+        self.upper = upper
+
+        # 交易状态
+        self.open_positions = []
+        self.bought_levels = set()
+        self.trades = []
+
+        # 盈利跟踪
+        self.realized_pnl = 0.0
+        self.total_fees = 0.0
+        self.profit_pool = 0.0
+        self.highest_sell_level_watermark = 0.0
+
+        # 统计
+        self.shift_count = 0
 
 # ==============================================================================
 # 1. 数据获取模块
@@ -129,22 +154,28 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
     reference_ma, reference_ma_initialized = 0.0, False
     # 【核心修正】引入“最高卖出水位线”
     highest_sell_level_watermark = 0.0
+    FORCE_MOVE = 360
+    outside_bars = 0  # ✅ 新增：初始化兜底逻辑的计数器
+    ma_change = 0.01
+    profit_pool = 0.0  # ✅ 新增: 利润池
+    REINVESTMENT_THRESHOLD = 200  # ✅ 新增: 复投阈值, e.g., 每赚500U就复投一次
 
     if verbose:
         print("回测开始...")
 
     # ===== 内部辅助函数 (execute_sell 已改造) =====
     def execute_sell(position, sell_price, timestamp, levels_snapshot, close_price, side="SELL", modify_global_state=True):
-        nonlocal cash, realized_pnl, total_fees, trades, open_positions, bought_levels, highest_sell_level_watermark
+        nonlocal cash, realized_pnl, total_fees, trades, open_positions, bought_levels, highest_sell_level_watermark, profit_pool
         trade_qty = position["qty"]   # 本次卖出的数量
         proceeds = trade_qty * sell_price
         fee = proceeds * fee_rate
         total_fees += fee
         net_proceeds = proceeds - fee
-        cash += net_proceeds
+        cash += position["cost"]  # 只把本金归还给 cash
 
         # 【修改】计算单笔利润
         single_profit = net_proceeds - position["cost"]
+        profit_pool += single_profit  # 把利润存入利润池
         realized_pnl += single_profit
 
         # === 是否修改全局仓位 ===
@@ -197,48 +228,55 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
 
     def redistribute_positions(current_price, timestamp, old_levels_snapshot):
         """
-        渐进式网格迁移（重写版）：
-        - 汇总所有仓位 + 现金，计算每个新格子的目标资金。
-        - 遗留仓位优先分配，不够用现金补。
-        - 多余遗留仓位直接卖出换现金。
+        渐进式网格迁移（优化版，精确计算手续费）
         """
         nonlocal open_positions, bought_levels, cash, total_fees, realized_pnl, levels
 
-        # === Step 1: 汇总资产 ===
+        # Step 1: 计算总资产
         total_asset_value = cash + \
             sum(p['qty'] * current_price for p in open_positions)
 
-        effective_grids = max(len(levels), 1)  # 至少保证 1，避免除零
-        value_per_grid = total_asset_value / effective_grids  # 每格目标资金
-        qty_per_grid = value_per_grid / current_price if current_price > 0 else 0
+        effective_grids = max(len(levels), 1)
+        ideal_value_per_grid = total_asset_value / effective_grids
+        ideal_qty_per_grid = ideal_value_per_grid / \
+            current_price if current_price > 0 else 0
 
-        if verbose:
-            print(
-                f"区间移动   -> 总净值 {total_asset_value:.2f}, 每格目标资金 {value_per_grid:.2f}")
-
-        # === Step 2: 把遗留仓位打包成一个“库存池” ===
+        # Step 2: 汇总现有持仓（survivors）
         survivors_pool = []
         for p in open_positions:
             if p["qty"] > 1e-8:
                 survivors_pool.append({
                     "qty": p["qty"],
                     "price": p["price"],
-                    "avg_cost": p["avg_cost"] if p["qty"] > 0 else current_price
+                    "avg_cost": p["avg_cost"]
                 })
 
-        survivors_pool.sort(key=lambda x: x["avg_cost"])  # 按成本低优先消耗
+        survivors_pool.sort(key=lambda x: x["avg_cost"])  # 成本低优先消耗
+        total_qty_on_hand = sum(p['qty'] for p in survivors_pool)
+
+        # Step 3: 计算理想目标总持仓量
+        total_target_qty = ideal_qty_per_grid * effective_grids
+
+        # Step 4: 计算净需购买量
+        net_buy_qty = max(total_target_qty - total_qty_on_hand, 0)
+        net_buy_value = net_buy_qty * current_price
+        fee_for_net_buy = net_buy_value * fee_rate
+
+        # Step 5: 修正可用于分配的资产
+        adjusted_total_asset = total_asset_value - fee_for_net_buy
+        adjusted_value_per_grid = adjusted_total_asset / effective_grids
+        adjusted_qty_per_grid = adjusted_value_per_grid / current_price
 
         new_positions = []
 
-        # === Step 3: 从上到下重新分配 ===
+        # Step 6: 重新分配每个网格
         for lv in sorted(levels, reverse=True):
             if lv <= current_price:
                 continue
 
-            qty_needed = qty_per_grid
+            qty_needed = adjusted_qty_per_grid
             cost_from_survivors, qty_from_survivors = 0.0, 0.0
 
-            # 先消耗遗留仓位
             while qty_needed > 1e-8 and survivors_pool:
                 sp = survivors_pool[0]
                 take_qty = min(sp["qty"], qty_needed)
@@ -252,7 +290,7 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
                 if sp["qty"] <= 1e-8:
                     survivors_pool.pop(0)
 
-            # 如果遗留仓位不足 → 用现金买
+            # 只为净购买部分计算手续费
             bought_position_part = None
             if qty_needed > 1e-8:
                 value_to_invest = qty_needed * current_price
@@ -268,10 +306,14 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
 
             if final_qty > 1e-8:
                 final_avg_cost = final_cost / final_qty
-                new_positions.append(
-                    {"price": lv, "qty": final_qty, "cost": final_cost, "avg_cost": final_avg_cost})
+                new_positions.append({
+                    "price": lv,
+                    "qty": final_qty,
+                    "cost": final_cost,
+                    "avg_cost": final_avg_cost
+                })
 
-        # === Step 4: 卖掉剩余的遗留仓位 ===
+        # Step 7: 卖掉剩余遗留仓位
         if survivors_pool:
             if verbose:
                 print(f"区间移动   -> 卖掉遗留 {len(survivors_pool)} 个仓位，换成现金")
@@ -351,11 +393,48 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
         highest_sell_level_watermark = init_price
 
         init_ts = df.iloc[0]['datetime']
-        init_levels = [lv for lv in levels if lv >=
-                       init_price]
-        for lv in sorted(init_levels):
-            execute_buy(lv, init_price, per_grid_capital_init,
-                        init_ts, levels, init_price, side="INIT_BUY")
+        init_levels_to_buy = [lv for lv in levels if lv >= init_price]
+
+        if init_levels_to_buy:
+            num_grids_to_buy = len(init_levels_to_buy)
+
+            # ✅ Step 2: "预计算" - 精确计算建仓所需的总手续费
+            # =========================================================================
+            # 我们假设总资本 capital 将被平均分配到这 num_grids_to_buy 个仓位上。
+
+            # 2.1 每个仓位理想中分配到的“税前”资本
+            capital_per_grid_before_fee = capital / num_grids_to_buy
+
+            # 2.2 计算每个仓位实际能购买的资产价值（税后）
+            #     总花费 = 购买价值 + 手续费 = 购买价值 + 购买价值 * fee_rate
+            #     所以，购买价值 = 总花费 / (1 + fee_rate)
+            value_to_invest_per_grid = (
+                capital_per_grid_before_fee / (1 + fee_rate)) * 0.9999
+
+            # 2.3 计算每个仓位需要支付的手续费
+            fee_per_grid = value_to_invest_per_grid * fee_rate
+
+            # 2.4 计算建仓所需的总手续费
+            total_fee_for_initiation = fee_per_grid * num_grids_to_buy
+
+            if verbose:
+                print(f"初始建仓   -> 计划在 {num_grids_to_buy} 个网格建仓，"
+                      f"预估总手续费: {total_fee_for_initiation:.4f} USDT")
+
+            # ✅ Step 3: "执行" - 使用精确的“税后”金额进行购买
+            # =========================================================================
+            for lv in sorted(init_levels_to_buy):
+                # 我们直接告诉 execute_buy 函数，每个格子应该投入多少“税后”的资金
+                execute_buy(
+                    level_price=lv,
+                    buy_price=init_price,
+                    value_to_invest=value_to_invest_per_grid,  # <--- 使用精确计算的税后金额
+                    timestamp=init_ts,
+                    levels_snapshot=levels,
+                    close_price=init_price,
+                    side="INIT_BUY"
+                )
+    # --- 结束初始建仓 ---
 
     # --- 主循环 ---
     ma_col_name = f'ma_{ma_period}'
@@ -379,14 +458,21 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
 
         if reference_ma is not None and not pd.isna(current_ma):
             ma_roc_from_ref = (current_ma - reference_ma) / reference_ma
-            if h > upper * (1 + breakout_buffer) and ma_roc_from_ref >= 0.005:
+            if h > upper * (1 + breakout_buffer) and ma_roc_from_ref >= ma_change:
                 shift_direction = "UP"
-            elif l < lower * (1 - breakout_buffer) and ma_roc_from_ref <= -0.005:
+            elif l < lower * (1 - breakout_buffer) and ma_roc_from_ref <= -ma_change:
                 shift_direction = "DOWN"
+            outside_bars += 1 if (c > upper or c < lower) else 0
+            if outside_bars >= FORCE_MOVE:
+                if c > upper:
+                    shift_direction = "UP_FORCED"
+                elif c < lower:
+                    shift_direction = "DOWN_FORCED"
+                outside_bars = 0  # 重置计数器
 
         if shift_direction:
             old_levels = levels
-            if shift_direction == "UP":
+            if shift_direction == "UP" or shift_direction == "UP_FORCED":
                 target_lower, target_upper = lower * 1.01, upper * 1.01
             else:  # SHIFT_DOWN
                 target_lower, target_upper = lower * 0.99, upper * 0.99
@@ -425,11 +511,70 @@ def simulate(df, initial_lower, initial_upper, n_grids, capital, fee_rate, ma_pe
         # 【核心修正】将常规交易逻辑的调用放在这里
         levels_sold_this_bar = set()
         process_bar_trades(o, h, l, c, ts)
+        # ✅ 新增：检查利润池是否达到复投阈值 (新版逻辑)
+        if profit_pool >= REINVESTMENT_THRESHOLD:
+            reinvest_amount = profit_pool
+            profit_pool = 0.0  # 清空利润池
+            cash += reinvest_amount  # 将利润正式注入现金池
+
+            if verbose:
+                print(f"{ts} 💰 利润复投事件: {reinvest_amount:.2f} USDT 已注入，"
+                      f"触发全局资产重分配...")
+
+            # ✅ 核心：直接调用 redistribute_positions 进行宏观调仓！
+            # old_levels_snapshot 在这里就是当前的 levels
+            redistribute_positions(c, ts, levels)
+
+            # ✅ 核心修正：用一个完整的元组来记录事件
+            # =========================================================================
+            # 为了保持数据格式一致，我们需要为所有14列都提供一个值
+
+            # 1. 先获取当前的账户快照
+            positions_snapshot = sorted([p['price'] for p in open_positions])
+            total_qty_snapshot = sum(p['qty'] for p in open_positions)
+            cash_snapshot = cash
+
+            # 2. 构建包含14个元素的元组
+            event_log = (
+                ts,                                            # time
+                "REINVEST_REDIST",                             # side
+                # level price (借用此列显示描述)
+                f"Profit reinvested: {reinvest_amount:.2f}",
+                None,                                          # linked_buy_price
+                None,                                          # average cost
+                None,                                          # trade_qty
+                None,                                          # amount_usdt
+                cash_snapshot,                                 # cash_balance
+                total_qty_snapshot,                            # total_qty
+                None,                                          # profit
+                f"{lower:.2f}-{upper:.2f}",                     # grid_range
+                c,                                             # close_price
+                positions_snapshot,                            # positions
+                levels                                         # levels_snapshot
+            )
+
+            trades.append(event_log)
 
     # === 最终结算 ===
     final_equity = cash + sum(p['qty'] * df.iloc[-1]['close']
                               for p in open_positions)
     return trades, realized_pnl, final_equity, total_fees, shift_count, open_positions
+
+
+def load_from_sqlite(db_path, symbol, start_date, end_date):
+    conn = sqlite3.connect(db_path)
+    query = f"""
+        SELECT 
+            datetime(open_time/1000, 'unixepoch') as datetime,
+            open, high, low, close, volume
+        FROM {symbol}_1m
+        WHERE datetime(open_time/1000, 'unixepoch') BETWEEN ? AND ?
+        ORDER BY open_time ASC
+    """
+    df = pd.read_sql_query(query, conn, params=(start_date, end_date))
+    conn.close()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    return df
 
 
 # ==============================================================================
@@ -440,15 +585,15 @@ if __name__ == "__main__":
     # ... (前面的 config 和数据加载部分无变动) ...
     config = {
         "symbol": "ETHUSDT",
-        "start_date": "2025-06-07",
+        "start_date": "2021-01-04",
         "end_date": "2025-09-23",
         "interval": "1m",
         "ma_period": 720,
         "capital": 10000,
         "fee_rate": 0.00026,
-        "lower_bound": 2200,
-        "upper_bound": 4000,
-        "grid_n_range": [72]
+        "lower_bound": 1203.49,
+        "upper_bound": 4061.376499999999,
+        "grid_n_range": [10]
     }
 
     # --- 1. 数据预加载与处理 ---
@@ -467,11 +612,19 @@ if __name__ == "__main__":
         df_full['datetime'] = pd.to_datetime(df_full['datetime'])
         print("数据加载完毕！")
     else:
-        df_full = fetch_binance_klines(
-            config["symbol"], config["interval"], preload_start_date_str, config["end_date"])
+        # ✅ 修改点：从调用 fetch_binance_klines 改为调用 load_from_sqlite
+        print(f"本地文件 '{DATA_FILENAME}' 不存在，尝试从数据库加载...")
+        # 假设你的数据库文件名为 'eth_data.db'
+        df_full = load_from_sqlite(
+            "eth_data.db",
+            config["symbol"],
+            preload_start_date_str,  # 使用预加载日期
+            config["end_date"]
+        )
+
         if not df_full.empty:
             df_full.to_csv(DATA_FILENAME, index=False)
-            print(f"数据已保存到 '{DATA_FILENAME}' 以便将来使用。")
+            print(f"数据已从数据库加载并缓存到 '{DATA_FILENAME}' 以便将来使用。")
 
     if df_full.empty:
         print("错误：未能获取K线数据，程序退出。")
