@@ -92,7 +92,7 @@ def build_levels(lower, upper, n_grids):
 def load_from_sqlite(db_path, symbol, start_date, end_date):
     conn = sqlite3.connect(db_path)
     query = f"""
-        SELECT 
+        SELECT
             datetime(open_time/1000, 'unixepoch') as datetime,
             open, high, low, close, volume
         FROM {symbol}_1m
@@ -107,7 +107,7 @@ def load_from_sqlite(db_path, symbol, start_date, end_date):
 
 class GridTrader:
     def __init__(self, capital, fee_rate, n_grids, initial_lower, initial_upper,
-                 ma_period, reinvest_threshold=200, force_move_bars=360, verbose=False):
+                 ma_period, reinvest_threshold=100, force_move_bars=360, verbose=False):
         """
         初始化交易引擎的所有状态和参数。
         """
@@ -130,7 +130,7 @@ class GridTrader:
         self.lower = 0
         self.upper = 0
         self.step = 0
-        self.trade_qty_per_grid = 0.0  # ✅ [新] 标准交易单位 (币数)
+        self.trade_qty_per_grid = 0.0
 
         # --- 盈利与成本跟踪 ---
         self.realized_pnl = 0.0
@@ -150,9 +150,24 @@ class GridTrader:
 
     def _log_trade(self, timestamp, side, level_price, linked_info, avg_cost,
                    qty, amount_usdt, profit, close_price, positions_snapshot, levels_snapshot):
+        # 在 GridTrader 类内部
+
+        def _format_positions_snapshot(positions_list):
+            """将持仓列表格式化为一个易读的字符串。"""
+            if not positions_list:
+                return "[]"
+
+            # 使用我们之前讨论的方法二
+            formatted_items = [
+                f"({price:.2f}, {qty:.3f})" for price, qty in positions_list]
+            return f"[{', '.join(formatted_items)}]"
+
         """统一的交易日志记录函数"""
-        total_qty_snapshot = sum(p['qty'] for p in self.open_positions)
-        grid_range_str = f"{self.lower:.2f}-{self.upper:.2f}" if self.levels else "N/A"
+        total_qty_snapshot = sum(item[1] for item in positions_snapshot)
+        grid_range_str = f"{levels_snapshot[0]:.2f}-{levels_snapshot[-1]:.2f}" if positions_snapshot else "N/A"
+
+        formatted_positions_str = _format_positions_snapshot(
+            positions_snapshot)
 
         log_entry = (
             timestamp,          # 交易时间
@@ -167,20 +182,24 @@ class GridTrader:
             profit,             # 卖出利润 (买入时为 None)
             grid_range_str,     # 网格区间
             close_price,        # 当前收盘价
-            positions_snapshot,  # 持仓快照
+            formatted_positions_str,  # 持仓快照
             levels_snapshot     # 网格快照
         )
         self.trades.append(log_entry)
 
     def _execute_buy(self, level_price, buy_price, qty_to_buy, timestamp, positions_snapshot, levels_snapshot, close_price, side="BUY", modify_global_state=True):
-        # nonlocal cash, total_fees, trades, open_positions, bought_levels
         if buy_price <= 0 or qty_to_buy <= 0:
             return None
-        raw_cost = qty_to_buy*buy_price
+        raw_cost = qty_to_buy * buy_price
         fee = raw_cost * self.fee_rate
         total_cost = raw_cost + fee
 
         if self.cash < total_cost:
+            if self.verbose:
+                print(f"{timestamp} 下单失败: {level_price:.2f}, "
+                      f"新标准交易单位: {self.trade_qty_per_grid:.6f}",
+                      f"目前现金: {self.cash:.9f}",
+                      f"所需资金: {total_cost:.9f}")
             return None
         self.cash -= total_cost
         self.total_fees += fee
@@ -191,14 +210,14 @@ class GridTrader:
             self.open_positions.append(new_position)
             self.bought_levels.add(level_price)
 
+        final_positions_snapshot = positions_snapshot
         self._log_trade(timestamp, side, level_price, f"market@{buy_price:.2f}",
                         new_position["avg_cost"], qty_to_buy, raw_cost,
-                        None, close_price, positions_snapshot, levels_snapshot)
+                        None, close_price, sorted(final_positions_snapshot), levels_snapshot)
         return new_position
 
     def _execute_sell(self, position, sell_price, timestamp, positions_snapshot, levels_snapshot, close_price, profit_to_pool, side="SELL", modify_global_state=True):
-        # nonlocal cash, realized_pnl, total_fees, trades, open_positions, bought_levels, highest_sell_level_watermark, profit_pool
-        trade_qty = position["qty"]   # 本次卖出的数量
+        trade_qty = position["qty"]
         proceeds = trade_qty * sell_price
         fee = proceeds * self.fee_rate
         self.total_fees += fee
@@ -208,8 +227,12 @@ class GridTrader:
         # 【修改】计算单笔利润
         single_profit = net_proceeds - position["cost"]
         if profit_to_pool:
-            self.profit_pool += single_profit  # 把利润存入利润池
-            self.cash += position["cost"]  # 只把本金归还给 cash
+            # 常规交易，利润进池
+            # 1. 净收入全部进入现金池
+            self.cash += net_proceeds
+            # 2. 然后，从现金池中，将利润“划转”到利润池
+            self.cash -= single_profit
+            self.profit_pool += single_profit
         else:
             self.cash += net_proceeds
         self.realized_pnl += single_profit
@@ -225,58 +248,80 @@ class GridTrader:
         self.highest_sell_level_watermark = max(
             self.highest_sell_level_watermark, sell_price)
 
+        position_price_to_remove = position["price"]
+        final_positions_snapshot = [
+            (price, qty) for price, qty in positions_snapshot if price != position_price_to_remove
+        ]
         self._log_trade(timestamp, side, round(sell_price, 2), position["price"],
                         position["avg_cost"], trade_qty, proceeds,
-                        single_profit, close_price, positions_snapshot, levels_snapshot)
+                        single_profit, close_price, final_positions_snapshot, levels_snapshot)
         return True
 
-    def _redistribute_positions(self, current_price, timestamp, old_levels_snapshot, init_or_not):
+    def compute_trade_qty_per_grid(self, capital, price, fee_rate, deploy, reserve):
+        # 成本：deploy 用当前价计，reserve 用格价计
+        deploy_cost = len(deploy) * price * (1 + fee_rate)
+        reserve_cost = sum(lv * (1 + fee_rate) for lv in reserve)
+
+        total_cost_factor = (deploy_cost + reserve_cost)*1.00001
+        if total_cost_factor > 1e-9:
+            Q = capital / total_cost_factor
+        else:
+            Q = 0
+
+        # print("需预留资金的仓位如下：")
+        # for lv in reserve:
+        #     print(lv)
+        # print("需即刻部署的仓位如下：")
+        # for lv in deploy:
+        #     print(lv)
+        # print("新标准交易单位：", Q)
+        return Q
+
+    def _redistribute_positions(self, current_price, timestamp, old_levels_snapshot):
         """
         (V6 - 数量本位 + 渐进式迁移)
         1. 根据总净值，计算出新的“标准交易单位”(trade_qty_per_grid)。
         2. 以此为标准，通过“渐进式”的迁移（优先利用旧仓位），完成对新持仓的部署。
         """
-        # nonlocal open_positions, bought_levels, cash, total_fees, realized_pnl, levels, trade_qty_per_grid
-
-        # === Step 1 & 2: 资产盘点并计算新的“标准交易单位” (与V5版完全相同) ===
+        # === Step 1 & 2: 资产盘点并计算新的“标准交易单位” ===
         total_positions_value = sum(
             p['qty'] * current_price for p in self.open_positions)
-        total_asset_value = self.cash + self.profit_pool + \
+        total_asset_value = self.cash + \
             total_positions_value  # ✅ 利润池在这里正式并入计算
         self.profit_pool = 0.0  # 盘点后立即清空，防止重复计算
 
-        deploy_levels = {lv for lv in self.levels if lv >= current_price}
-        reserve_levels = {lv for lv in self.levels if lv < current_price}
-        num_deploy_grids = len(deploy_levels)
+        # ✅ 核心修正：根据不同的场景，定义不同的“应持仓”范围
+        # =========================================================================
+        highest_level = self.levels[-1]
 
-        # ... (计算 trade_qty_per_grid 的成本方程逻辑不变) ...
-        cost_factor_for_deployment = current_price * (1 + self.fee_rate)
-        cost_factor_for_reserves = sum(reserve_levels) * (1 + self.fee_rate)
-        total_cost_factor = (
-            num_deploy_grids * cost_factor_for_deployment) + cost_factor_for_reserves
+        deploy_levels = {
+            lv for lv in self.levels
+            if lv >= current_price and lv != highest_level}
+        reserve_levels = {
+            lv for lv in self.levels if lv not in deploy_levels and lv != highest_level}
 
-        if total_cost_factor > 1e-9:
-            self.trade_qty_per_grid = total_asset_value / total_cost_factor*0.999
-        else:
-            self.trade_qty_per_grid = 0
+        old_qty = self.trade_qty_per_grid
+        self.trade_qty_per_grid = self.compute_trade_qty_per_grid(
+            total_asset_value, current_price, self.fee_rate, deploy_levels, reserve_levels)
 
         if self.verbose:
-            print(f"{timestamp} 🏦 宏观调仓: 总净值={total_asset_value:.2f}, "
+            print(f"{timestamp} 🏦 网格移动调仓: 总净值={total_asset_value:.2f}, "
+                  f"旧标准交易单位: {old_qty:.6f}"
                   f"新标准交易单位: {self.trade_qty_per_grid:.6f}")
 
         # === ✅ [核心修改] Step 3: "渐进式迁移" 执行逻辑 ===
 
         # 3.1 打包现有持仓，作为“可分配的资产池”
         survivors_pool = sorted(
-            [{"qty": p["qty"], "price": p["price"], "avg_cost": p["avg_cost"]}
-             for p in self.open_positions if p["qty"] > 1e-8],
+            [{"qty": p["qty"], "price": p["price"], "cost": p["cost"], "avg_cost": p["avg_cost"]}
+             for p in self.open_positions if p["qty"] > 1e-9],
             key=lambda x: x["avg_cost"]  # 按成本从低到高排序，优先保留低成本仓位
         )
 
         new_positions = []
 
         # 3.2 遍历所有【新的持仓目标格】，用“资产池”和“现金”去填满它们
-        for lv in sorted(list(deploy_levels)):
+        for lv in sorted(list(deploy_levels), reverse=True):
             qty_needed = self.trade_qty_per_grid  # 每个目标格都需要这么多数量的币
 
             cost_from_survivors = 0.0
@@ -306,10 +351,10 @@ class GridTrader:
                     timestamp=timestamp,
                     # 快照应该是当时的、正在构建中的新仓位列表
                     positions_snapshot=sorted(
-                        [p['price'] for p in new_positions]),
+                        [(p['price'], p['qty']) for p in new_positions]),
                     levels_snapshot=self.levels,
                     close_price=current_price,
-                    side=init_or_not,
+                    side="SHIFT_BUY",
                     modify_global_state=False
                 )
 
@@ -390,8 +435,7 @@ class GridTrader:
                                               sell_price=next_level,
                                               timestamp=ts,
                                               positions_snapshot=sorted(
-                                                  # 卖出前一刻的快照
-                                                  [pos['price'] for pos in self.open_positions if pos != p]),
+                                                  [(pos['price'], pos['qty']) for pos in self.open_positions if pos != p]),
                                               levels_snapshot=self.levels,
                                               close_price=c,
                                               profit_to_pool=True):
@@ -416,7 +460,6 @@ class GridTrader:
                                       close_price=c,  # <--- 补上这个缺失的参数
                                       side="BUY"
                                       )
-                    self.bought_levels.add(lv)
 
     def _initial_setup(self, df):
         """处理初始建仓的私有方法"""
@@ -428,13 +471,9 @@ class GridTrader:
 
         # 初始建仓也应该是一次宏观调仓，所以我们直接调用 redistribute_positions，它会计算出初始的 trade_qty_per_grid
         # 并根据初始价格部署仓位
-        if not self.levels:
-            self.levels, self.step = build_levels(
-                self.initial_lower, self.initial_upper, self.n_grids)
-            self.lower, self.upper = self.levels[0], self.levels[-1]
 
         self._redistribute_positions(
-            init_price, df.iloc[0]['datetime'], old_levels_snapshot=self.levels, init_or_not="INIT_BUY")
+            init_price, df.iloc[0]['datetime'], old_levels_snapshot=self.levels)
 
         # 初始化MA参考点
         first_ma = df.iloc[0][f'ma_{self.ma_period}']
@@ -492,7 +531,7 @@ class GridTrader:
             self.highest_sell_level_watermark = c
 
             self._redistribute_positions(
-                c, ts, old_levels, init_or_not="SHIFT BUY")
+                c, ts, old_levels)
 
             self.shift_count += 1
             boundary_changed = True
@@ -500,27 +539,109 @@ class GridTrader:
 
             # 记录事件
             self._log_trade(timestamp=ts, side=f"SHIFT_{shift_direction}", level_price="Grid Shifted & Redistributed",
-                            linked_info=None, avg_cost=None, qty=None, amount_usdt=None, profit=None, close_price=c, positions_snapshot=[(p['price'], p['qty']) for p in self.open_positions], levels_snapshot=self.levels)
+                            linked_info=None, avg_cost=None, qty=None, amount_usdt=None, profit=None, close_price=c, positions_snapshot=sorted([(p['price'], p['qty']) for p in self.open_positions]), levels_snapshot=self.levels)
 
         return boundary_changed
 
     def _check_and_handle_reinvestment(self, c, ts):
         """
+        (V3 - 基于独立的 compute_trade_qty_per_grid 函数)
         检查并处理利润复投的逻辑。
+        1. 优先用利润补足现有持仓至新的“标准交易单位”。
+        2. 剩余利润自动并入现金池，增强未来购买力。
         """
         if self.profit_pool >= self.REINVESTMENT_THRESHOLD:
+
+            # === Step 1: 暂存利润并进行“沙盘推演” ===
             reinvest_amount = self.profit_pool
 
             if self.verbose:
-                print(f"{ts} 💰 利润复投事件: {reinvest_amount:.2f} USDT,触发全局资产重分配...")
+                print(f"{ts} 💰 利润复投事件: {reinvest_amount:.2f} USDT 可用...")
 
-            # 直接调用 redistribute_positions，它会自动把 profit_pool 的钱算进去
-            self._redistribute_positions(
-                c, ts, self.levels, init_or_not="REINVEST BUY")
+            # 1.1 假设利润已全部注入，计算理想中的总资产
+            total_positions_value = sum(
+                p['qty'] * c for p in self.open_positions)
+            temp_total_asset_value = self.cash + reinvest_amount + total_positions_value
 
-            # 记录事件
-            self._log_trade(ts, "REINVEST_REDIST", f"Profit reinvested: {reinvest_amount:.2f}",
-                            None, None, None, None, None, c, positions_snapshot=[(p['price'], p['qty']) for p in self.open_positions], levels_snapshot=self.levels)
+            # 1.2【调用你的函数】计算新的“目标标准交易单位” (new_target_qty)
+            #     我们需要为你的函数准备正确的 deploy 和 reserve 集合
+            highest_level = self.levels[-1]
+            #     在复投场景下，我们假设所有低于最高格的格子都是目标
+            all_potential_grids = {
+                lv for lv in self.levels if lv != highest_level}
+            deploy_for_calc = {p['price'] for p in self.open_positions}
+            reserve_for_calc = {
+                lv for lv in all_potential_grids if lv not in deploy_for_calc}
+
+            new_target_qty = self.compute_trade_qty_per_grid(
+                temp_total_asset_value, c, self.fee_rate,
+                deploy_for_calc, reserve_for_calc
+            )
+
+            # === Step 2: 计算补足现有持仓所需的成本 ===
+            cash_needed_for_add_on = 0
+            qty_to_add_per_position = {}
+
+            for p in self.open_positions:
+                qty_diff = new_target_qty - p['qty']
+                if qty_diff > 1e-9:
+                    qty_to_add_per_position[p['price']] = qty_diff
+                    cash_needed_for_add_on += (qty_diff * c) * \
+                        (1 + self.fee_rate)
+
+            # === Step 3: 决策与执行 ===
+            if reinvest_amount >= cash_needed_for_add_on:
+                # 利润充足，执行补仓
+                if self.verbose and cash_needed_for_add_on > 0:
+                    print(
+                        f"    -> 使用 {cash_needed_for_add_on:.2f} USDT 利润补足 {len(qty_to_add_per_position)} 个现有持仓...")
+
+                # 3.1 利润正式注入现金池
+                self.profit_pool = 0.0
+                self.cash += reinvest_amount
+
+                # 3.2 遍历并执行补仓
+                for p in self.open_positions:
+                    if p['price'] in qty_to_add_per_position:
+                        qty_to_add = qty_to_add_per_position[p['price']]
+
+                        buy_result = self._execute_buy(
+                            level_price=p['price'], buy_price=c, qty_to_buy=qty_to_add,
+                            timestamp=ts,
+                            positions_snapshot=sorted(
+                                [(pos['price'], pos['qty']) for pos in self.open_positions]),
+                            levels_snapshot=self.levels, close_price=c,
+                            side="REINVEST_ADD", modify_global_state=False  # 我们自己手动更新
+                        )
+
+                        if buy_result:
+                            # 手动更新仓位信息
+                            p['qty'] += buy_result['qty']
+                            p['cost'] += buy_result['cost']
+                            p['avg_cost'] = p['cost'] / \
+                                p['qty'] if p['qty'] > 0 else 0
+
+                # 3.3 补仓后，全局的 trade_qty_per_grid 正式更新为新目标
+                self.trade_qty_per_grid = new_target_qty
+
+            else:
+                # 利润不足，本次跳过，等待下次
+                if self.verbose:
+                    print(
+                        f"    -> 利润 {reinvest_amount:.2f} 不足以支付补仓所需 {cash_needed_for_add_on:.2f}, 本次跳过复投。")
+                # 利润没有被使用，所以 profit_pool 保持不变 (之前暂存了)
+                pass  # profit_pool 在开头被暂存，这里不做操作，它就保持原样
+
+            # 记录一个完成/跳过事件
+            log_side = "REINVEST_DONE" if reinvest_amount >= cash_needed_for_add_on else "REINVEST_SKIPPED"
+            log_msg = f"New Q={self.trade_qty_per_grid:.4f}" if log_side == "REINVEST_DONE" else f"Needed {cash_needed_for_add_on:.2f}"
+            self._log_trade(
+                ts, log_side, log_msg,
+                None, None, None, None, None, c,
+                positions_snapshot=sorted(
+                    [(p['price'], p['qty']) for p in self.open_positions]),
+                levels_snapshot=self.levels
+            )
 
     def simulate(self, df):
         # 1. 初始化网格和状态
@@ -533,7 +654,7 @@ class GridTrader:
         if self.verbose:
             print("回测开始...")
 
-         # 2. 初始建仓 (使用一个专门的私有方法)
+        # 2. 初始建仓 (使用一个专门的私有方法)
         self._initial_setup(df)
         # --- 结束初始建仓 ---
 
@@ -544,18 +665,17 @@ class GridTrader:
 
         for i in range(1, len(df)):
             o, h, l, c, ts, current_ma = (data_arrays[col][i] for col in [
-                                          'open', 'high', 'low', 'close', 'datetime', ma_col_name])
+                'open', 'high', 'low', 'close', 'datetime', ma_col_name])
 
             # 【核心修正】将常规交易逻辑的调用放在这里
             self.levels_sold_this_bar = set()
+            # 步骤 3.3: 检查并处理利润复投
+            self._check_and_handle_reinvestment(c, ts)
             # 步骤 3.1: 检查并处理网格移动
             self._check_and_handle_grid_shift(h, l, c, ts, current_ma)
 
             # 步骤 3.2: 执行常规的买卖交易
             self._process_bar_trades(o, h, l, c, ts)
-
-            # 步骤 3.3: 检查并处理利润复投
-            self._check_and_handle_reinvestment(c, ts)
 
         # === 最终结算 ===
         final_equity = self.cash + sum(p['qty'] * df.iloc[-1]['close']
@@ -570,16 +690,16 @@ class GridTrader:
 if __name__ == "__main__":
     # ... (前面的 config 和数据加载部分无变动) ...
     config = {
-        "symbol": "ETHUSDT",
+        "symbol": "BTCUSDT",
         "start_date": "2025-06-07",
         "end_date": "2025-09-23",
         "interval": "1m",
         "ma_period": 720,
-        "capital": 10000,
+        "capital": 5000,
         "fee_rate": 0.00026,
-        "lower_bound": 2500,
-        "upper_bound": 4500,
-        "grid_n_range": [10]
+        "lower_bound": 94015.7,
+        "upper_bound": 124015,
+        "grid_n_range": [18]
     }
 
     # --- 1. 数据预加载与处理 ---
@@ -643,7 +763,7 @@ if __name__ == "__main__":
                         initial_lower=config["lower_bound"],
                         initial_upper=config["upper_bound"],
                         ma_period=config["ma_period"],
-                        verbose=False
+                        verbose=True
                     )
 
                     # 运行回测，并获取结果
