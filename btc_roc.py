@@ -61,13 +61,21 @@ def fetch_binance_klines(symbol, interval, start_date_str, end_date_str):
     return df
 
 
-def add_indicators(df, period=720):
+def add_indicators(df, long_period=720, short_period=120):
     """
     为DataFrame添加技术指标：
     - MA: 移动平均线
     """
-    print(f"正在计算 {period} 分钟的移动平均线...")
-    df[f'ma_{period}'] = df['close'].rolling(window=period).mean()
+    print(f"正在计算 {long_period} (长期) 和 {short_period} (短期) 分钟的移动平均线...")
+
+    # 计算长期均线
+    df[f'ma_{long_period}'] = df['close'].rolling(
+        window=long_period, min_periods=1).mean()
+
+    # 计算短期均线
+    df[f'ma_{short_period}'] = df['close'].rolling(
+        window=short_period, min_periods=1).mean()
+
     print("指标计算完毕！")
     return df
 
@@ -121,6 +129,7 @@ class GridTrader:
         self.initial_upper = initial_upper
         self.ma_period = ma_period
         self.verbose = verbose
+        self.strategy_params = strategy_params
 
         # --- 策略状态 ---
         self.cash = capital
@@ -138,6 +147,7 @@ class GridTrader:
         self.realized_pnl = 0.0
         self.total_fees = 0.0
         self.profit_pool = 0.0
+        self.fee_buffer = strategy_params.get("fee_buffer", 0.2)
 
         # --- 网格移动控制 ---
         self.shift_count = 0
@@ -146,6 +156,11 @@ class GridTrader:
         # 使用 .get() 方法，如果字典中没有这个键，就使用一个安全的默认值
         self.REINVESTMENT_THRESHOLD = strategy_params.get(
             "reinvest_threshold", 70)
+        # ✅ 新增：为智能复投器增加状态和参数
+        # ==================================================================
+        self.last_reinvest_ts = pd.NaT  # 记录上一次复投的时间戳，初始化为空
+        self.reinvest_cooldown_minutes = strategy_params.get(
+            "reinvest_cooldown_minutes", 720)  # 示例：默认冷却12小时
         self.FORCE_MOVE_BARS = strategy_params.get("force_move_bars", 360)
         self.breakout_buffer = strategy_params.get("breakout_buffer", 0.01)
         self.ma_change_threshold = strategy_params.get(
@@ -300,7 +315,7 @@ class GridTrader:
 
         return True
 
-    def _compute_trade_qty_per_grid(self, capital, price, fee_rate, deploy, reserve, safety_factor=0.999):
+    def _compute_trade_qty_per_grid(self, capital, price, fee_rate, deploy, reserve, fee_buffer, safety_factor=0.999):
         """
         (V3 - 混合稳健版)
         根据总资本，使用混合成本模型计算标准交易单位。
@@ -324,13 +339,16 @@ class GridTrader:
         # 确保 deploy 和 reserve 没有交集
         assert deploy.isdisjoint(reserve), "逻辑错误: deploy 和 reserve 集合存在交集！"
 
-        # 1. 计算部署区的总成本系数
-        # 这部分的成本是确定的，必须按当前价计算
-        deploy_cost_factor = len(deploy) * price * (1 + fee_rate)
+        # 1. 引入手续费冗余
+        effective_fee_rate = fee_rate * (1 + fee_buffer)
+
+        # 2. ✅【您的优化】deploy 区也按各自的格线价 `lv` 计算成本，使模型统一
+        deploy_cost_factor = len(deploy) * price * (1 + effective_fee_rate)
 
         # 2. 计算储备区的总成本系数
         # 这部分的成本是基于未来的、更优价格的估算
-        reserve_cost_factor = sum(lv * (1 + fee_rate) for lv in reserve)
+        reserve_cost_factor = sum(lv * (1 + effective_fee_rate)
+                                  for lv in reserve)
 
         # 3. 计算总成本系数
         total_cost_factor = deploy_cost_factor + reserve_cost_factor
@@ -368,7 +386,7 @@ class GridTrader:
 
         old_qty = self.trade_qty_per_grid
         self.trade_qty_per_grid = self._compute_trade_qty_per_grid(
-            total_asset_value, current_price, self.fee_rate, deploy_levels, reserve_levels)
+            total_asset_value, current_price, self.fee_rate, deploy_levels, reserve_levels, self.fee_buffer)
 
         # ✅ [新增] 记录 Q 值计算的详细依据
         # =========================================================================
@@ -646,7 +664,7 @@ class GridTrader:
         # 初始建仓时，总资产就是初始资本
         self.trade_qty_per_grid = self._compute_trade_qty_per_grid(
             self.capital, init_price, self.fee_rate,
-            deploy_levels, reserve_levels
+            deploy_levels, reserve_levels, self.fee_buffer
         )
 
         # ✅ 记录“初始化开始”事件
@@ -799,7 +817,39 @@ class GridTrader:
 
         return boundary_changed
 
-    def _check_and_handle_reinvestment(self, c, ts):
+    def _decide_reinvestment_ratio(self, c, ma_short, ma_long, ts):
+        """
+        (修复版) 智能复投决策器，根据市场状态返回复投比例 (0.0 到 1.0)。
+        """
+        # ==================================================================
+        # ✅ 关键修复：统一时间戳类型
+        # ==================================================================
+        # 1. 将 NumPy 的时间戳转换为 Pandas 的 Timestamp 对象
+        now_ts = pd.to_datetime(ts)
+
+        # 2. 检查冷却时间
+        cooldown_delta = pd.Timedelta(minutes=self.reinvest_cooldown_minutes)
+        # pd.NaT 是 Pandas 中表示 "Not a Time" 的标准方式
+        if pd.notna(self.last_reinvest_ts) and (now_ts - self.last_reinvest_ts) < cooldown_delta:
+            return 0.0, "COOLDOWN"
+        # ==================================================================
+
+        # 2. 检查数据有效性
+        if pd.isna(ma_short) or pd.isna(ma_long):
+            return 0.3, "NO_MA_DATA"
+
+        # 3. 趋势判断
+        ma_long_upper_band = ma_long * 1.01
+        ma_long_lower_band = ma_long * 0.99
+
+        if c > ma_short > ma_long_upper_band:
+            return 1.0, "UPTREND"
+        elif c < ma_short < ma_long_lower_band:
+            return 0.0, "DOWNTREND"
+        else:
+            return 0.3, "CHOPPY"
+
+    def _check_and_handle_reinvestment(self, c, ts, current_ma_long, current_ma_short):
         """
         (V3 - 基于独立的 compute_trade_qty_per_grid 函数)
         检查并处理利润复投的逻辑。
@@ -807,15 +857,61 @@ class GridTrader:
         2. 剩余利润自动并入现金池，增强未来购买力。
         """
         if self.profit_pool >= self.REINVESTMENT_THRESHOLD:
+            # 1. 调用决策器获取复投比例和原因
+            reinvest_ratio, reason = self._decide_reinvestment_ratio(
+                c, current_ma_short, current_ma_long, ts)
+
+            if self.verbose:
+                # 准备一份用于非交易事件的通用快照
+                positions_snapshot = sorted(
+                    [(p['price'], p['qty']) for p in self.open_positions])
+
+                self._log_trade(
+                    timestamp=ts, side="REINVEST_DECISION",
+                    level_price=f"Ratio: {reinvest_ratio}", linked_info=f"Reason: {reason}",
+                    watermark_snapshot=self.highest_sell_level_watermark,
+                    avg_cost=None, qty=None, amount_usdt=None, profit=None,
+                    close_price=c,
+                    positions_snapshot=positions_snapshot,
+                    levels_snapshot=self.levels,
+                    profit_pool_snapshot=self.profit_pool,  # 决策前的利润池
+                    cash_snapshot=self.cash,
+                    single_trade_fee=None,
+                    total_fees_snapshot=self.total_fees
+                )
+
+            if reinvest_ratio > 0:
+                # 2. 计算实际要复投的金额
+                reinvest_amount = self.profit_pool * reinvest_ratio
+
+                # 3. 执行资金划转
+                self.cash += reinvest_amount
+                self.profit_pool -= reinvest_amount
+                self.last_reinvest_ts = ts  # 更新最后复投时间戳
+
+                if self.verbose:
+                    # 再次获取快照，因为 cash 和 profit_pool 已经改变
+                    positions_snapshot = sorted(
+                        [(p['price'], p['qty']) for p in self.open_positions])
+
+                    self._log_trade(
+                        timestamp=ts, side="PROFIT_TO_CASH",
+                        level_price=f"Amount: {reinvest_amount:.2f}", linked_info=f"Ratio: {reinvest_ratio}",
+                        watermark_snapshot=self.highest_sell_level_watermark,
+                        avg_cost=None, qty=None, amount_usdt=None, profit=None,
+                        close_price=c,
+                        positions_snapshot=positions_snapshot,
+                        levels_snapshot=self.levels,
+                        profit_pool_snapshot=self.profit_pool,  # 划转后的利润池
+                        cash_snapshot=self.cash,              # 划转后的现金
+                        single_trade_fee=None,
+                        total_fees_snapshot=self.total_fees
+                    )
+            # 如果 ratio 为 0，则不执行任何操作，利润继续留在利润池中等待下次机会。
 
             # --- 暂存旧状态以供日志记录 ---
-            reinvest_amount = self.profit_pool
+            reinvest_amount = self.profit_pool*reinvest_ratio
             old_qty = self.trade_qty_per_grid
-
-            # --- Step 1: 统一资金来源 (采纳您的核心建议) ---
-            # 立即将利润池资金并入主现金池，并清空利润池
-            self.cash += self.profit_pool
-            self.profit_pool = 0.0
 
             # ✅ 替换 print: 用一个 "BEFORE" 事件来记录
             if self.verbose:
@@ -846,7 +942,7 @@ class GridTrader:
 
             new_target_qty = self._compute_trade_qty_per_grid(
                 temp_total_asset_value, c, self.fee_rate,
-                deploy_for_calc, reserve_for_calc
+                deploy_for_calc, reserve_for_calc, self.fee_buffer
             )
             # ✅ [新增] 记录 Q 值计算的详细依据
             # =========================================================================
@@ -946,7 +1042,7 @@ class GridTrader:
             if self.verbose:
                 if executed_reinvestment:
                     log_side = "REINVEST_DONE"
-                    log_msg = f"Q: {old_qty:.9f} -> {self.trade_qty_per_grid:.9f} Pool used: {reinvest_amount:.2f}"
+                    log_msg = f"Q: {old_qty:.9f} -> {self.trade_qty_per_grid:.9f} Pool used: {reinvest_amount:.4f}"
                 else:
                     log_side = "REINVEST_SKIPPED"
                     log_msg = f"Cash insufficient. Needed ${cash_needed_for_add_on:.2f}, Have ${self.cash:.2f}; Pool was {reinvest_amount:.2f}"
@@ -977,32 +1073,41 @@ class GridTrader:
         # --- 结束初始建仓 ---
 
         # 3. 主循环 (现在是纯粹的流程编排)
-        ma_col_name = f'ma_{self.ma_period}'
-        data_arrays = {col: df[col].to_numpy() for col in [
-            'open', 'high', 'low', 'close', 'datetime', ma_col_name]}
+        ma_long_col_name = f'ma_{self.ma_period}'
+        ma_short_col_name = f'ma_{self.strategy_params.get("ma_short_period", 120)}'
+
+        required_cols = ['open', 'high', 'low', 'close',
+                         'datetime', ma_long_col_name, ma_short_col_name]
+
+        data_arrays = {col: df[col].to_numpy() for col in required_cols}
 
         for i in range(1, len(df)):
-            o, h, l, c, ts, current_ma = (data_arrays[col][i] for col in [
-                'open', 'high', 'low', 'close', 'datetime', ma_col_name])
+            o, h, l, c, ts, current_ma_long, current_ma_short = (data_arrays[col][i] for col in [
+                'open', 'high', 'low', 'close', 'datetime', ma_long_col_name, ma_short_col_name])
 
             # 【核心修正】将常规交易逻辑的调用放在这里
             self.levels_sold_this_bar = set()
             self.levels_bought_this_bar = set()
-            # 步骤 3.1: 检查并处理网格移动
-            self._check_and_handle_grid_shift(h, l, c, ts, current_ma)
-            # 步骤 3.3: 检查并处理利润复投
-            self._check_and_handle_reinvestment(c, ts)
 
-            # 步骤 3.2: 执行常规的买卖交易
+            # ✅ 建议优化：调整调用顺序
+            # ==================================================================
+            # 步骤 3.1: (原3.2) 首先执行本根K线的常规买卖，这可能会产生新的利润
             self._process_bar_trades(o, h, l, c, ts)
 
+            # 步骤 3.2: (原3.3) 然后，检查利润池，并根据行情决定是否复投
+            self._check_and_handle_reinvestment(
+                c, ts, current_ma_long, current_ma_short)
+
+            # 步骤 3.3: (原3.1) 最后，进行宏观的网格移动检查
+            self._check_and_handle_grid_shift(h, l, c, ts, current_ma_long)
+            # ==================================================================
         # === 最终结算 ===
         final_equity = self.cash + self.profit_pool + sum(p['qty'] * df.iloc[-1]['close']
                                                           for p in self.open_positions)
         return self.trades, self.realized_pnl, final_equity, self.total_fees, self.shift_count, self.open_positions
 
 # ==============================================================================
-# 5. 主程序/业务流程编排 (重构版)
+# 5. 主程序/业务流程编排
 # ==============================================================================
 
 
@@ -1041,7 +1146,8 @@ def setup_backtest_data(config):
             # ✅ 核心修正：在保存CSV之前，先计算指标！
             # =================================================================
             print("首次加载数据，正在计算并缓存指标...")
-            df_full = add_indicators(df_full, period=config["ma_period"])
+            df_full = add_indicators(
+                df_full, long_period=config["ma_period"], short_period=config["ma_short_period"])
 
             print(f"数据及指标已加载，正在创建缓存文件 '{data_filename}'")
             df_full.to_csv(data_filename, index=False)
@@ -1055,7 +1161,8 @@ def setup_backtest_data(config):
         ma_col = f"ma_{config['ma_period']}"
         if ma_col not in df_full.columns or df_full[ma_col].isnull().all():
             print(f"警告：CSV缓存 '{data_filename}' 中缺少指标，正在重新计算...")
-            df_full = add_indicators(df_full, period=config["ma_period"])
+            df_full = add_indicators(
+                df_full, long_period=config["ma_period"], short_period=config["ma_short_period"])
 
         # --- 3. 数据切片 ---
         start_bound = pd.to_datetime(config["start_date"])
@@ -1144,7 +1251,8 @@ def run_single_backtest(params):
     """
     为单个参数组合运行一次完整的回测。 (核心引擎/Worker)
     """
-    config, df_backtest, param_row = params
+    config, cache_file, param_row = params
+    df_backtest = pd.read_parquet(cache_file)
 
     # 🚀 优化点 1: 更优雅地合并参数
     # 首先，从全局config中复制一份基础参数
@@ -1198,7 +1306,7 @@ def run_single_backtest(params):
         return (run_id, None, None, error_msg)
 
 
-def run_parameter_scan_refactored(config, df_backtest):
+def run_parameter_scan_refactored(config, cache_file):
     """
     (重构版)
     执行单参数（n_grids）扫描回测，并生成Excel报告。
@@ -1207,6 +1315,8 @@ def run_parameter_scan_refactored(config, df_backtest):
     results_list = []
     output_filename = f"backtest_{config['symbol']}_report.xlsx"
 
+    details_folder = f"backtest_details_{config['symbol']}"
+    os.makedirs(details_folder, exist_ok=True)
     try:
         with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
             grid_values = config["grid_n_range"]
@@ -1220,7 +1330,7 @@ def run_parameter_scan_refactored(config, df_backtest):
                     "upper": config["upper_bound"],
                     "n_grids": n_grids_value
                 }
-                tasks.append((config, df_backtest, param_row))
+                tasks.append((config, cache_file, param_row))
 
             print(f"\n--- 开始单参数扫描 ({len(tasks)} 组参数) ---")
             for task in tqdm(tasks, desc="单参数扫描中"):
@@ -1234,50 +1344,49 @@ def run_parameter_scan_refactored(config, df_backtest):
                 results_list.append(summary)
 
                 # 在主进程中安全地写入详细交易日志
-                sheet_name = f"Details_{summary['网格数量']}"
-                trade_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                detail_csv_path = os.path.join(
+                    details_folder, f"Details_{summary['网格数量']}.csv")
+                trade_df.to_csv(detail_csv_path, index=False)
 
-            # ==================================================================
-            # ✅ 关键修复：在这里加入与 batch 模式完全一致的列排序逻辑
+             # ✅ 最终版本：与 batch 模式完全一致的列排序和报告逻辑
             # ==================================================================
             print("\n--- 所有回测计算完成，正在生成最终汇总报告 ---")
             if results_list:
-                # 将汇总结果列表转换为DataFrame
+                # 1. 将汇总结果列表转换为DataFrame
                 summary_df = pd.DataFrame(results_list)
                 summary_df.sort_values(
                     by='总盈亏(%)', ascending=False, inplace=True)
 
-                # 1) 结果指标（我们希望这些指标排在最前面）
+                # 2. 定义核心结果指标的顺序
                 result_cols = [
                     '总盈亏(%)', '已实现盈亏', '未实现盈亏', '卖出次数',
                     '单次均利', '当前持仓', '总手续费', '移动次数'
                 ]
 
-                # 2) 我们希望紧接在结果指标后面的两个特定参数（如果存在）
-                special_params = ['shift_ratio', 'ma_change_threshold']
-
-                # 3) 核心参数（中文）排在参数区前面
+                # 3. 定义核心参数的顺序
                 core_param_cols = ['下限', '上限', '网格数量']
 
-                # 4) 其余的参数列（动态检测）
-                other_param_cols = [col for col in summary_df.columns
-                                    if col not in (result_cols + special_params + core_param_cols)]
+                # 4. 动态查找所有其他的参数列
+                all_summary_cols = summary_df.columns.tolist()
+                other_param_cols = [col for col in all_summary_cols
+                                    if col not in result_cols and col not in core_param_cols]
 
-                # 5) 最终列顺序：结果指标 -> special_params -> 核心参数 -> 其它参数
-                final_cols = result_cols + [p for p in special_params if p in summary_df.columns] + \
-                    [c for c in core_param_cols if c in summary_df.columns] + \
-                    other_param_cols
+                # 5. 拼接成最终的列顺序
+                final_cols = result_cols + core_param_cols + other_param_cols
 
-                # 应用最终顺序（只保留实际存在的列）
+                # 6. 应用新的列顺序
                 summary_df = summary_df[[
                     col for col in final_cols if col in summary_df.columns]]
 
-                # 写入 Excel
+                # 7. 将排好序的汇总DataFrame写入Excel
+                # (注意：ExcelWriter 'writer' 在这个函数的 try 块开头已经定义好了)
                 summary_df.to_excel(
                     writer, sheet_name='Summary', index=False, float_format='%.2f')
 
-                print("\n--- 批量汇总报告 ---")
-                print(summary_df.to_string())
+                # 8. 打印报告到控制台
+                print("\n--- 汇总报告 ---")
+                # 这里之前是 print(summary_df.to_string())，现在统一调用标准打印函数
+                print_summary_report(summary_df)
 
         print(f"\n✅ 完整回测报告已成功保存到: {output_filename}")
 
@@ -1290,109 +1399,90 @@ def run_parameter_scan_refactored(config, df_backtest):
 # ==============================================================================
 
 
-def run_batch_scan_parallel(config, df_backtest, param_csv):
+def run_batch_scan_parallel(config, cache_file, param_csv):
     """
-    (并行版)
-    从CSV文件加载多组参数，使用多进程并行执行回测，并生成一份包含
-    汇总报告和各组参数详细交易记录的Excel文件。
-
-    Args:
-        config (dict): 全局配置字典。
-        df_backtest (pd.DataFrame): 用于回测的K线数据。
-        param_csv (str): 包含参数组合的CSV文件路径。
+    (V-Final - 修复版)
+    并行执行回测，汇总进Excel，明细进CSV。
     """
-    # 1. 检查并读取参数文件
+    # 1. 检查和准备 (逻辑不变)
     if not os.path.exists(param_csv):
         print(f"❌ 参数CSV文件不存在: {param_csv}")
         return
-
     param_df = pd.read_csv(param_csv)
     required_cols = {"lower", "upper", "n_grids"}
     if not required_cols.issubset(param_df.columns):
         print(f"❌ 参数CSV缺少必须列: {required_cols}")
         return
 
-    # 2. 准备要分发给每个工作进程的任务列表
-    # 每个任务是一个元组，包含所有`run_single_backtest`需要的参数
-    tasks = [(config, df_backtest, row) for _, row in param_df.iterrows()]
-
+    details_folder = f"batch_details_{config['symbol']}"
+    os.makedirs(details_folder, exist_ok=True)
+    tasks = [(config, cache_file, row.to_dict())
+             for _, row in param_df.iterrows()]
     results_list = []
     output_filename = f"batch_parallel_{config['symbol']}_report.xlsx"
 
-    # 3. 创建并管理进程池
-    # max_workers不指定时，默认为系统的CPU核心数。可以根据内存情况适当调低。
+    # 2. 并行执行回测并收集所有结果 (逻辑不变)
     with concurrent.futures.ProcessPoolExecutor() as executor:
         print(f"\n--- 开始并行批量回测 ({len(tasks)} 组参数) ---")
-
-        # 使用executor.map将tasks列表中的每个任务分发给一个工作进程
-        # executor.map会按顺序返回结果
         results_iterator = executor.map(run_single_backtest, tasks)
 
-        # 4. 在主进程中，安全地打开一个Excel文件写入器
-        with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+        # 先将所有结果收集到内存中
+        collected_results = [result for result in tqdm(
+            results_iterator, total=len(tasks), desc="并行批量回测中")]
 
-            # 5. 遍历从工作进程返回的结果，并用tqdm显示进度条
-            for result in tqdm(results_iterator, total=len(tasks), desc="并行批量回测中"):
-                run_id, summary, trade_df, error = result
+    # ==================================================================
+    # ✅ 关键修复：在所有计算完成后，再统一进行文件IO操作
+    # ==================================================================
+    print("\n--- 所有回测计算完成，正在处理和保存结果 ---")
 
-                # 检查工作进程是否返回了错误
-                if error:
-                    print(f"\n⚠️ 跳过出错的参数组 {run_id}。")
-                    # 如果需要看详细错误，可以取消下面这行注释
-                    # print(f"错误详情: {error}")
-                    continue
+    # 3. 遍历收集到的结果，保存CSV明细并准备汇总列表
+    for result in collected_results:
+        run_id, summary, trade_df, error = result
+        if error:
+            print(f"\n⚠️ 跳过出错的参数组 {run_id}。")
+            continue
 
-                # 6. 将成功的汇总结果收集起来
-                results_list.append(summary)
+        results_list.append(summary)
 
-                # 7. 将详细的交易记录DataFrame写入Excel的一个独立工作表
-                # 这是安全的操作，因为只有主进程在执行写入
-                sheet_name = f"Details_{run_id}"
-                # 确保工作表名称长度不超过Excel的31个字符限制
-                if len(sheet_name) > 31:
-                    sheet_name = sheet_name[:31]
-                trade_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        # 保存详细交易日志到CSV
+        detail_csv_path = os.path.join(details_folder, f"Details_{run_id}.csv")
+        try:
+            trade_df.to_csv(detail_csv_path, index=False)
+        except Exception as e:
+            print(f"\n🔥 警告：无法保存详情文件 {detail_csv_path}. 错误: {e}")
 
-           # ==================================================================
-            # ✅ 关键修复：在这里使用与 single 模式完全一致的列排序逻辑
-            # ==================================================================
-            print("\n--- 所有回测计算完成，正在生成最终汇总报告 ---")
-            if results_list:
-                summary_df = pd.DataFrame(results_list)
-                summary_df.sort_values(
-                    by='总盈亏(%)', ascending=False, inplace=True)
+    # 4. 如果有成功的结果，则生成并保存汇总报告到Excel
+    if results_list:
+        summary_df = pd.DataFrame(results_list)
+        summary_df.sort_values(by='总盈亏(%)', ascending=False, inplace=True)
 
-                # 1. 定义核心结果指标的顺序
-                result_cols = [
-                    '总盈亏(%)', '已实现盈亏', '未实现盈亏', '卖出次数',
-                    '单次均利', '当前持仓', '总手续费', '移动次数'
-                ]
+        # (列排序逻辑保持不变)
+        result_cols = [
+            '总盈亏(%)', '已实现盈亏', '未实现盈亏', '卖出次数',
+            '单次均利', '当前持仓', '总手续费', '移动次数'
+        ]
+        core_param_cols = ['下限', '上限', '网格数量']
+        all_summary_cols = summary_df.columns.tolist()
+        other_param_cols = [col for col in all_summary_cols
+                            if col not in result_cols and col not in core_param_cols]
+        final_cols = result_cols + core_param_cols + other_param_cols
+        summary_df = summary_df[[
+            col for col in final_cols if col in summary_df.columns]]
 
-                # 2. 定义核心参数的顺序
-                core_param_cols = ['下限', '上限', '网格数量']
-
-                # 3. 动态查找所有其他的参数列
-                all_summary_cols = summary_df.columns.tolist()
-                other_param_cols = [col for col in all_summary_cols
-                                    if col not in result_cols and col not in core_param_cols]
-
-                # 4. 拼接成最终的列顺序
-                final_cols = result_cols + core_param_cols + other_param_cols
-
-                # 5. 应用新的列顺序
-                summary_df = summary_df[[
-                    col for col in final_cols if col in summary_df.columns]]
-
-                # 写入 Excel
+        # a. 将【只包含汇总】的DataFrame写入Excel文件
+        try:
+            with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
                 summary_df.to_excel(
                     writer, sheet_name='Summary', index=False, float_format='%.2f')
+        except Exception as e:
+            print(f"\n🔥 警告：无法保存Excel汇总报告 {output_filename}. 错误: {e}")
 
-                # 打印报告
-                print("\n--- 批量汇总报告 ---")
-                print_summary_report(summary_df)
-            # ==================================================================
+        # b. 打印报告到控制台
+        print("\n--- 批量汇总报告 ---")
+        print_summary_report(summary_df)
 
-    print(f"\n✅ 批量并行回测报告已成功保存到: {output_filename}")
+    print(
+        f"\n✅ 批量并行回测报告已成功保存到: {output_filename} (详情见 '{details_folder}' 文件夹)")
 
 
 def main():
@@ -1406,16 +1496,17 @@ def main():
         "start_date": "2021-01-04",
         "end_date": "2025-10-02",
         "interval": "1m",
-        "ma_period": 720,
+        "ma_period": 720,  # 这将被视为 ma_long_period
+        "ma_short_period": 120,  # 示例值: 120分钟 (2小时) 均线
         "capital": 10000,
         "fee_rate": 0.00026,
         "verbose": True,  # 回测引擎是否打印详细日志
         "param_csv": "param_grid.csv",  # batch 模式下需要的文件
 
         # --- "single" 模式下的网格参数 ---
-        "lower_bound": 1272.8,
-        "upper_bound": 4060.82,
-        "grid_n_range": [10],  # 可以测试多个参数
+        "lower_bound": 1636.39,
+        "upper_bound": 4060.8185,
+        "grid_n_range": [90],  # 可以测试多个参数
         # ==================================================================
         # ✅ 这里就是您要修改的地方：统一的策略参数配置区
         # ==================================================================
@@ -1423,24 +1514,50 @@ def main():
 
         # --- 利润复投参数 ---
         "reinvest_threshold": 70,  # 旧值: 100, 新值: 150 (利润池超过150才复投)
+        "reinvest_cooldown_minutes": 720,
+
 
         # --- 网格移动参数 ---
         "force_move_bars": 360,     # 旧值: 360, 新值: 720 (价格在网格外12小时才强制移动)
         "breakout_buffer": 0.01,    # 旧值: 0.01, 新值: 0.02 (价格需突破上下轨2%才触发移动)
         "ma_change_threshold": 0.01,  # 旧值: 0.01, 新值: 0.03 (MA均线变化超过3%才确认趋势)
-        "shift_ratio": 0.01       # 旧值: 0.01, 新值: 0.015 (每次网格移动1.5%)
+        "shift_ratio": 0.01,       # 旧值: 0.01, 新值: 0.015 (每次网格移动1.5%)
+        "fee_buffer": 0
     }
 
     # 步骤 1: 准备数据
     df_for_backtest = setup_backtest_data(config)
 
-    # 步骤 2: 执行回测与分析
-    if config["mode"] == "single":
-        run_parameter_scan_refactored(config, df_for_backtest)
-    elif config["mode"] == "batch":
-        run_batch_scan_parallel(config, df_for_backtest, config["param_csv"])
-    else:
-        print(f"❌ 未知模式: {config['mode']}, 请选择 'single' 或 'batch'")
+    if df_for_backtest is None or df_for_backtest.empty:
+        print("数据准备失败，无法执行回测。")
+        return
+
+    # 定义临时数据文件的路径
+    cache_file = f"_backtest_cache_{config['symbol']}.parquet"
+    print(f"为并行计算准备共享数据文件: '{cache_file}'")
+    df_for_backtest.to_parquet(cache_file, index=False)
+
+    # ==================================================================
+    # ✅ 关键修复：在这里传递 cache_file (文件路径)，而不是 df_for_backtest
+    # ==================================================================
+    try:
+        # 步骤 2: 执行回测与分析
+        if config["mode"] == "single":
+            # 传递文件路径
+            run_parameter_scan_refactored(config, cache_file)
+        elif config["mode"] == "batch":
+            # 传递文件路径
+            run_batch_scan_parallel(config, cache_file, config["param_csv"])
+        else:
+            print(f"❌ 未知模式: {config['mode']}, 请选择 'single' 或 'batch'")
+
+    finally:
+        # ✅ (可选但推荐) 无论成功或失败，都清理临时文件
+        try:
+            os.remove(cache_file)
+            print(f"已清理临时数据文件: '{cache_file}'")
+        except OSError as e:
+            print(f"清理临时文件失败: {e}")
 
 
 if __name__ == "__main__":
