@@ -6,6 +6,9 @@ import os
 import traceback
 from tqdm import tqdm
 import concurrent.futures
+import glob
+import uuid
+import psutil
 
 
 def fetch_binance_klines(symbol, interval, start_date_str, end_date_str):
@@ -66,6 +69,9 @@ def add_indicators(df, long_period=720, short_period=120):
     为DataFrame添加技术指标：
     - MA: 移动平均线
     """
+    if df.empty or len(df) < long_period:
+        print(
+            f"⚠️ 警告：数据长度 ({len(df)}) 不足以计算长周期MA({long_period})，指标可能不稳定或全为NaN。")
     print(f"正在计算 {long_period} (长期) 和 {short_period} (短期) 分钟的移动平均线...")
 
     # 计算长期均线
@@ -117,7 +123,7 @@ def load_from_sqlite(db_path, symbol, start_date, end_date):
 
 class GridTrader:
     def __init__(self, capital, fee_rate, n_grids, initial_lower, initial_upper,
-                 ma_period, strategy_params, verbose=False):
+                 ma_period, strategy_params, run_id, verbose=False):
         """
         初始化交易引擎的所有状态和参数。
         """
@@ -167,6 +173,39 @@ class GridTrader:
             "ma_change_threshold", 0.01)
         self.shift_ratio = strategy_params.get("shift_ratio", 0.01)
         self.outside_bars = 0
+
+        self.run_id = run_id  # ✅ 保存 run_id
+        self.log_chunk_counter = 0  # 用于分块文件命名
+        self.log_chunk_size = 50000  # 可配置
+
+        self.trade_df_columns = [  # ✅ 将列名定义移到这里，方便复用
+            "time", "side", "level price", "linked_buy_price", "watermark",
+            "average cost", "trade_qty", "amount_usdt", "cash_balance", "total_qty", "profit",
+            "profit_pool", "fee", "total_fee", "total_capital",
+            "close_price", "grid_range", "positions", "levels_snapshot"
+        ]
+
+    def _flush_trades_to_disk(self):
+        if not self.trades:
+            return
+
+        # 定义分块文件的路径和名称
+        temp_log_folder = "temp_trade_logs"
+        os.makedirs(temp_log_folder, exist_ok=True)
+        chunk_filename = f"{self.run_id}_chunk_{self.log_chunk_counter}.csv"
+        chunk_filepath = os.path.join(temp_log_folder, chunk_filename)
+
+        # 创建DataFrame并写入CSV
+        chunk_df = pd.DataFrame(self.trades, columns=self.trade_df_columns)
+
+        # 如果是第一个块，写入表头；否则不写表头，以便后续拼接
+        write_header = self.log_chunk_counter == 0
+        chunk_df.to_csv(chunk_filepath, index=False,
+                        header=write_header, mode='a')
+
+        # 清空内存列表并增加计数器
+        self.trades.clear()
+        self.log_chunk_counter += 1
 
     def _log_trade(self, timestamp, side, level_price, linked_info, watermark_snapshot, avg_cost,
                    qty, amount_usdt, profit, close_price, positions_snapshot, levels_snapshot, profit_pool_snapshot, cash_snapshot, single_trade_fee, total_fees_snapshot):
@@ -220,6 +259,10 @@ class GridTrader:
             levels_snapshot_str     # 网格快照
         )
         self.trades.append(log_entry)
+
+        # ✅ 检查是否达到阈值，如果达到则写入磁盘
+        if len(self.trades) >= self.log_chunk_size:
+            self._flush_trades_to_disk()
 
     def _execute_buy(self, level_price, buy_price, qty_to_buy, timestamp, positions_snapshot, levels_snapshot, close_price, side="BUY", modify_global_state=True):
         if buy_price <= 0 or qty_to_buy <= 0:
@@ -982,7 +1025,7 @@ class GridTrader:
                 # 3. 执行资金划转
                 self.cash += reinvest_amount
                 self.profit_pool -= reinvest_amount
-                self.last_reinvest_ts = ts  # 更新最后复投时间戳
+                self.last_reinvest_ts = pd.to_datetime(ts)  # 更新最后复投时间戳
 
                 if self.verbose:
                     # 再次获取快照，因为 cash 和 profit_pool 已经改变
@@ -1199,9 +1242,11 @@ class GridTrader:
             self._check_and_handle_grid_shift(h, l, c, ts, current_ma_long)
             # ==================================================================
         # === 最终结算 ===
+        # ✅ 在函数返回之前，清空最后剩余的日志
+        self._flush_trades_to_disk()
         final_equity = self.cash + self.profit_pool + sum(p['qty'] * df.iloc[-1]['close']
                                                           for p in self.open_positions)
-        return self.trades, self.realized_pnl, final_equity, self.total_fees, self.shift_count, self.open_positions
+        return [], self.realized_pnl, final_equity, self.total_fees, self.shift_count, self.open_positions
 
 # ==============================================================================
 # 5. 主程序/业务流程编排
@@ -1218,7 +1263,7 @@ def setup_backtest_data(config):
     try:
         # --- 1. 数据加载与缓存 ---
         preload_start_date = datetime.strptime(
-            config["start_date"], "%Y-%m-%d") - timedelta(minutes=config["ma_period"], days=1)
+            config["start_date"], "%Y-%m-%d") - timedelta(days=1) - timedelta(minutes=config["ma_period"])
         preload_start_date_str = preload_start_date.strftime("%Y-%m-%d")
 
         data_filename = f"{config['symbol']}_{config['interval']}_{preload_start_date_str}_to_{config['end_date']}.csv"
@@ -1236,9 +1281,6 @@ def setup_backtest_data(config):
                 preload_start_date_str,
                 config["end_date"]
             )
-            if not df_full.empty:
-                print(f"数据已加载并缓存到 '{data_filename}'")
-                df_full.to_csv(data_filename, index=False)
 
             # ✅ 核心修正：在保存CSV之前，先计算指标！
             # =================================================================
@@ -1282,7 +1324,8 @@ def generate_summary(params, realized, final_equity, total_fees, shift_count, fi
     """ (最终修复版) 生成包含所有测试参数、使用中文键的汇总字典 """
     total_pnl = final_equity - params["capital"]
     unrealized_pnl = total_pnl - realized
-    sell_trades_count = len(trade_df[trade_df['side'] == 'SELL'])
+    sell_trades_count = len(trade_df[trade_df['side'].str.startswith(
+        'SELL', na=False)]) if 'side' in trade_df.columns else 0
     avg_profit_per_sell = realized / sell_trades_count if sell_trades_count > 0 else 0
 
     # ==================================================================
@@ -1344,27 +1387,100 @@ def print_summary_report(results_df):
     print("=" * len(report_string.split('\n')[0]))
 
 
+# def run_single_backtest(params):
+#     """
+#     为单个参数组合运行一次完整的回测。 (核心引擎/Worker)
+#     """
+#     config, cache_file, param_row = params
+#     df_backtest = pd.read_parquet(cache_file)
+
+#     # 🚀 优化点 1: 更优雅地合并参数
+#     # 首先，从全局config中复制一份基础参数
+#     final_params = config.copy()
+#     # 然后，用 param_row (来自CSV) 中的特定值覆盖基础参数
+#     final_params.update(param_row)
+
+#     # 从合并后的参数中提取所需变量
+#     lower = final_params["lower"]
+#     upper = final_params["upper"]
+#     n_grids = int(final_params["n_grids"])
+
+#     run_id = f"L{lower}_U{upper}_N{n_grids}"
+
+#     try:
+#         trader = GridTrader(
+#             capital=config["capital"],
+#             fee_rate=config["fee_rate"],
+#             n_grids=n_grids,
+#             initial_lower=lower,
+#             initial_upper=upper,
+#             ma_period=config["ma_period"],
+#             strategy_params=final_params,
+#             verbose=config.get("verbose", False)
+#         )
+
+#         trades, realized, final_equity, total_fees, shift_count, final_positions = trader.simulate(
+#             df_backtest)
+
+#         # ✅ 新增：聚合所有日志块文件
+#         temp_log_folder = "temp_trade_logs"
+#         final_trade_df = pd.DataFrame()
+#         chunks = []
+#         for i in range(trader.log_chunk_counter):
+#             chunk_filename = f"{run_id}_chunk_{i}.csv"
+#             chunk_filepath = os.path.join(temp_log_folder, chunk_filename)
+#             if os.path.exists(chunk_filepath):
+#                 chunks.append(pd.read_csv(chunk_filepath))
+#                 os.remove(chunk_filepath)  # 读取后删除
+
+#         if chunks:
+#             final_trade_df = pd.concat(chunks, ignore_index=True)
+
+#         # 5. 生成汇总
+#         summary = generate_summary(
+#             final_params, realized, final_equity,
+#             total_fees, shift_count, final_positions, trade_df
+#         )
+
+#         # 6. 返回结果
+#         return (run_id, summary, final_trade_df, None)
+
+#     except Exception as e:
+#         # 7. 返回错误
+#         error_msg = f"参数组 {run_id} 发生错误: {e}\n{traceback.format_exc()}"
+#         return (run_id, None, None, error_msg)
+
 def run_single_backtest(params):
     """
-    为单个参数组合运行一次完整的回测。 (核心引擎/Worker)
+    (V-Final - 内存优化版)
+    为单个参数组合运行一次完整的回测。
+    此版本在 GridTrader 执行后，负责从磁盘聚合分块日志。
     """
     config, cache_file, param_row = params
-    df_backtest = pd.read_parquet(cache_file)
 
-    # 🚀 优化点 1: 更优雅地合并参数
-    # 首先，从全局config中复制一份基础参数
+    # --- 准备工作 ---
+    # 确保 param_row 是字典
+    param_row_dict = param_row.to_dict() if isinstance(
+        param_row, pd.Series) else param_row
     final_params = config.copy()
-    # 然后，用 param_row (来自CSV) 中的特定值覆盖基础参数
-    final_params.update(param_row)
+    final_params.update(param_row_dict)
 
-    # 从合并后的参数中提取所需变量
     lower = final_params["lower"]
     upper = final_params["upper"]
     n_grids = int(final_params["n_grids"])
-
-    run_id = f"L{lower}_U{upper}_N{n_grids}"
+    # ✅ 关键修复 #3: 生成唯一的 run_id，防止并行文件冲突
+    # ==================================================================
+    run_id = f"L{lower}_U{upper}_N{n_grids}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+    # ==================================================================
 
     try:
+        # --- 1. 数据加载 ---
+        df_backtest = pd.read_parquet(cache_file)
+        df_backtest['datetime'] = pd.to_datetime(df_backtest['datetime'])
+        if 'index' in df_backtest.columns:
+            df_backtest = df_backtest.drop(columns=['index'])
+
+        # --- 2. 执行回测 ---
         trader = GridTrader(
             capital=config["capital"],
             fee_rate=config["fee_rate"],
@@ -1373,33 +1489,57 @@ def run_single_backtest(params):
             initial_upper=upper,
             ma_period=config["ma_period"],
             strategy_params=final_params,
+            run_id=run_id,  # ✅ 关键修复：传递 run_id
             verbose=config.get("verbose", False)
         )
 
-        trades, realized, final_equity, total_fees, shift_count, final_positions = trader.simulate(
+        # simulate() 现在返回一个空的 trades 列表，真正的日志在磁盘上
+        _, realized, final_equity, total_fees, shift_count, final_positions = trader.simulate(
             df_backtest)
 
-        # 4. 转换交易记录为DataFrame
-        trade_df_columns = [
-            "time", "side", "level price", "linked_buy_price", "watermark",
-            "average cost", "trade_qty", "amount_usdt", "cash_balance", "total_qty", "profit",
-            "profit_pool", "fee", "total_fee", "total_capital",
-            "close_price", "grid_range", "positions", "levels_snapshot"
-        ]
-        trade_df = pd.DataFrame(trades, columns=trade_df_columns)
+        # ==================================================================
+        # ✅ 关键修复 #2: 使用 glob 模式安全地聚合所有日志块文件
+        # ==================================================================
+        temp_log_folder = "temp_trade_logs"
+        final_trade_df = pd.DataFrame()
 
-        # 5. 生成汇总
+        if os.path.exists(temp_log_folder):
+            chunks = []
+            pattern = os.path.join(temp_log_folder, f"{run_id}_chunk_*.csv")
+            # sorted() 确保按块的顺序合并
+            for chunk_filepath in sorted(glob.glob(pattern)):
+                try:
+                    chunks.append(pd.read_csv(chunk_filepath))
+                    os.remove(chunk_filepath)
+                except pd.errors.EmptyDataError:
+                    os.remove(chunk_filepath)
+                    continue
+
+            if chunks:
+                final_trade_df = pd.concat(chunks, ignore_index=True)
+        # ==================================================================
+        # ==================================================================
+
+         # ==================================================================
+        # ✅ 关键修复 #1: generate_summary 调用时传递正确的 final_trade_df
+        # ==================================================================
         summary = generate_summary(
             final_params, realized, final_equity,
-            total_fees, shift_count, final_positions, trade_df
+            total_fees, shift_count, final_positions,
+            final_trade_df
         )
+        # ==================================================================
 
-        # 6. 返回结果
-        return (run_id, summary, trade_df, None)
+        # --- 4. 返回结果 ---
+        return (run_id, summary, final_trade_df, None)
 
     except Exception as e:
-        # 7. 返回错误
         error_msg = f"参数组 {run_id} 发生错误: {e}\n{traceback.format_exc()}"
+        # 在子进程中打印错误，方便调试
+        print("\n" + "!"*20 +
+              f" EXCEPTION in worker for run_id: {run_id} " + "!"*20)
+        traceback.print_exc()
+        print("!" * (62 + len(run_id)) + "\n")
         return (run_id, None, None, error_msg)
 
 
@@ -1519,9 +1659,14 @@ def run_batch_scan_parallel(config, cache_file, param_csv):
     output_filename = f"batch_parallel_{config['symbol']}_report.xlsx"
 
     # ==================================================================
-    # ✅ 关键修改：使用 as_completed 实现流式处理，优化内存
+    # ✅ 关键修复 #6: 动态限制并行度，防止内存峰值过高
     # ==================================================================
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    # 使用物理核心数的一半作为最大工作进程数，更保守安全
+    max_workers = max(1, psutil.cpu_count(logical=False) // 2)
+    print(f"INFO: 并行计算将使用最多 {max_workers} 个工作进程。")
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # ==================================================================
         print(f"\n--- 开始并行批量回测 ({len(tasks)} 组参数) ---")
 
         # 1. 提交所有任务，得到一个 future 对象的列表
@@ -1579,7 +1724,7 @@ def main():
     主程序入口，负责编排整个回测流程。
     """
     config = {
-        "mode": "single",          # "single" 或 "batch"
+        "mode": "batch",          # "single" 或 "batch"
 
         "symbol": "ETHUSDT",
         "start_date": "2021-01-04",
