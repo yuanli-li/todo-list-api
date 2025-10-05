@@ -1530,8 +1530,23 @@ def run_single_backtest(params):
         )
         # ==================================================================
 
-        # --- 4. 返回结果 ---
-        return (run_id, summary, final_trade_df, None)
+        # ==================================================================
+        # ✅ 关键修改 #2 & #3: 在子进程内部直接保存完整的交易明细CSV
+        # ==================================================================
+        # a. 定义一个专门存放最终明细的文件夹
+        details_folder = f"batch_details_{config['symbol']}"
+        os.makedirs(details_folder, exist_ok=True)
+
+        # b. 定义本次任务唯一的输出文件路径
+        detail_csv_path = os.path.join(details_folder, f"Details_{run_id}.csv")
+
+        # c. 将聚合后的完整 trade_df 写入该文件
+        if not final_trade_df.empty:
+            final_trade_df.to_csv(detail_csv_path, index=False)
+        # ==================================================================
+
+        # ✅ 关键修改 #2: 只返回轻量级的 summary 和 run_id
+        return (run_id, summary, None)  # 第三个返回值为 None，表示成功
 
     except Exception as e:
         error_msg = f"参数组 {run_id} 发生错误: {e}\n{traceback.format_exc()}"
@@ -1659,11 +1674,16 @@ def run_batch_scan_parallel(config, cache_file, param_csv):
     output_filename = f"batch_parallel_{config['symbol']}_report.xlsx"
 
     # ==================================================================
-    # ✅ 关键修复 #6: 动态限制并行度，防止内存峰值过高
+    # ✅ 关键修改 #4: 动态或硬编码限制最大工作进程数
     # ==================================================================
-    # 使用物理核心数的一半作为最大工作进程数，更保守安全
-    max_workers = max(1, psutil.cpu_count(logical=False) // 2)
-    print(f"INFO: 并行计算将使用最多 {max_workers} 个工作进程。")
+    # 对于内存密集型任务，一个保守的策略是使用物理核心数的一半，或者直接指定一个较小的数
+    try:
+        # 使用物理核心数的一半，且最少为1，最多不超过8 (避免在超多核服务器上失控)
+        max_workers = min(max(1, psutil.cpu_count(logical=False) // 2), 8)
+    except ImportError:
+        max_workers = 4  # 如果没有psutil库，默认一个安全的数值
+    print(f"INFO: 为保证系统稳定，并行计算将使用最多 {max_workers} 个工作进程。")
+    # ==================================================================
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         # ==================================================================
@@ -1676,22 +1696,16 @@ def run_batch_scan_parallel(config, cache_file, param_csv):
         # 2. 使用 as_completed，它会在任何一个 future 完成时立即返回
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="并行批量回测中"):
             try:
-                # a. 获取已完成任务的结果
-                run_id, summary, trade_df, error = future.result()
+                # ✅ 关键修改 #2: 不再接收巨大的 trade_df
+                run_id, summary, error = future.result()
 
                 if error:
-                    print(f"\n⚠️ 跳过出错的参数组 {run_id}。")
+                    # 现在可以在主进程中安全地打印子进程的详细错误
+                    print(f"\n⚠️ 参数组 {run_id} 在执行中出错:\n{error}")
                     continue
 
-                # b. 立即处理结果：收集 summary
+                # 只收集轻量级的 summary
                 results_list.append(summary)
-
-                # c. 立即处理结果：将巨大的 trade_df 写入磁盘
-                detail_csv_path = os.path.join(
-                    details_folder, f"Details_{run_id}.csv")
-                trade_df.to_csv(detail_csv_path, index=False)
-
-                # d. trade_df 变量的内存会在下一次循环开始时被自动回收，不会累积！
 
             except Exception as exc:
                 print(f'\n🔥 一个任务在获取结果时产生了异常: {exc}')
@@ -1701,7 +1715,6 @@ def run_batch_scan_parallel(config, cache_file, param_csv):
     print("\n--- 所有回测计算完成，正在生成最终汇总报告 ---")
     if results_list:
         summary_df = pd.DataFrame(results_list)
-        # ... (排序和写入Excel的逻辑不变)
 
         # a. 将【只包含汇总】的DataFrame写入Excel文件
         try:
@@ -1709,14 +1722,15 @@ def run_batch_scan_parallel(config, cache_file, param_csv):
                 summary_df.to_excel(
                     writer, sheet_name='Summary', index=False, float_format='%.2f')
         except Exception as e:
-            print(f"\n🔥 警告：无法保存Excel汇总报告 {output_filename}. 错误: {e}")
+            print(f"\n🔥 警告:无法保存Excel汇总报告 {output_filename}. 错误: {e}")
 
         # b. 打印报告到控制台
         print("\n--- 批量汇总报告 ---")
         print_summary_report(summary_df)
 
-    print(
-        f"\n✅ 批量并行回测报告已成功保存到: {output_filename} (详情见 '{details_folder}' 文件夹)")
+    details_folder = f"batch_details_{config['symbol']}"
+    print(f"\n✅ 批量并行回测报告已成功保存到: {output_filename}")
+    print(f"   详细交易日志已分别保存到 '{details_folder}' 文件夹下的各个CSV文件中。")
 
 
 def main():
@@ -1734,7 +1748,7 @@ def main():
         "ma_short_period": 120,  # 示例值: 120分钟 (2小时) 均线
         "capital": 10000,
         "fee_rate": 0.00026,
-        "verbose": True,  # 回测引擎是否打印详细日志
+        "verbose": False if config.get("mode") == "batch" else True,
         "param_csv": "param_grid.csv",  # batch 模式下需要的文件
 
         # --- "single" 模式下的网格参数 ---
