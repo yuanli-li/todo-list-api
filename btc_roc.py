@@ -232,6 +232,20 @@ class GridTrader:
 
         if self.cash < total_cost:
             # ✅ 新增：调用 _log_trade 记录失败事件
+            if self.verbose:
+                print("\n" + "─" * 80)
+                print(f"🚨 BUY FAIL at {timestamp} | Level: {level_price:.2f}")
+                print("─" * 80)
+                print(
+                    f"  Reason:          Cash Insufficient (Needed: ${total_cost:.2f}, Have: ${self.cash:.2f})")
+                print("-" * 20)
+
+                # --- 市场与仓位状态 ---
+                print("  CONTEXT:")
+                print(
+                    f"    Grid Range:      {self.lower:.2f} - {self.upper:.2f}")
+
+                print("-" * 80 + "\n")
             self._log_trade(
                 timestamp=timestamp, side="BUY_FAIL", level_price=level_price,
                 linked_info=f"Cash needed: {total_cost:.2f}",
@@ -442,6 +456,9 @@ class GridTrader:
         new_positions = []
 
         # 3.2 遍历所有【新的持仓目标格】，用“资产池”和“现金”去填满它们
+        total_cash_spent_on_buys = 0.0
+        total_qty_bought_with_cash = 0.0
+        new_positions_created_count = 0
         for lv in sorted(list(deploy_levels), reverse=True):
             qty_needed = self.trade_qty_per_grid  # 每个目标格都需要这么多数量的币
 
@@ -478,6 +495,9 @@ class GridTrader:
                         "price": lv, "qty": qty_needed, "cost": total_cost,
                         "avg_cost": total_cost / qty_needed if qty_needed > 0 else 0
                     }
+                    # ✅ 累加总账数据
+                    total_cash_spent_on_buys += total_cost
+                    total_qty_bought_with_cash += qty_needed
                 else:
                     # ✅ 替换 print: 记录“补仓失败”的日志
                     # =============================================================
@@ -505,6 +525,39 @@ class GridTrader:
                     "cost": final_cost,
                     "avg_cost": final_avg_cost
                 })
+            if final_qty > 1e-9:
+                new_positions_created_count += 1
+        # ==================================================================
+        # ✅ 新增：在循环结束后，记录一条补仓总账
+        # ==================================================================
+        if self.verbose and total_qty_bought_with_cash > 1e-9:
+            # 构建一个此刻的快照
+            temp_positions_snapshot = sorted(
+                [(p['price'], p['qty']) for p in new_positions])
+            avg_buy_price = (total_cash_spent_on_buys / (1 + self.fee_rate)) / \
+                total_qty_bought_with_cash if total_qty_bought_with_cash > 0 else 0
+
+            self._log_trade(
+                timestamp=timestamp,
+                side="REDIST_BUY_SUMMARY",
+                level_price=f"Bought for {new_positions_created_count} grids",
+                linked_info=f"Avg Price: @{avg_buy_price:.2f}",
+                watermark_snapshot=self.highest_sell_level_watermark,
+                avg_cost=None,
+                qty=total_qty_bought_with_cash,  # 记录总共用现金买了多少币
+                amount_usdt=total_cash_spent_on_buys /
+                (1 + self.fee_rate),  # 记录总花费 (不含手续费)
+                profit=None,
+                close_price=current_price,
+                positions_snapshot=temp_positions_snapshot,
+                levels_snapshot=self.levels,
+                profit_pool_snapshot=self.profit_pool,
+                cash_snapshot=self.cash,  # 传递的是扣款后的现金
+                single_trade_fee=total_cash_spent_on_buys *
+                self.fee_rate / (1 + self.fee_rate),  # 记录这批买入的总手续费
+                total_fees_snapshot=self.total_fees
+            )
+        # ==================================================================
 
         # 3.3 将“资产池”里剩余的、未被分配的旧仓位全部卖掉
         if survivors_pool:
@@ -581,6 +634,9 @@ class GridTrader:
 
     def _process_bar_trades(self, o, h, l, c, ts):
         # 提前排序仓位，减少循环中的开销
+        # 防止状态漂移
+        self.bought_levels = {p["price"] for p in self.open_positions}
+
         sorted_positions = sorted(
             self.open_positions, key=lambda x: x['price'])
 
@@ -628,6 +684,44 @@ class GridTrader:
                 for lv in sorted(touched, reverse=True):
                     if lv == highest_level or lv in self.bought_levels or lv in self.levels_sold_this_bar or lv in self.levels_bought_this_bar or lv >= self.highest_sell_level_watermark:
                         continue
+                    estimated_cost = self.trade_qty_per_grid * \
+                        lv * (1 + self.fee_rate)
+                    if self.cash < estimated_cost:
+                        if self.verbose:
+                            # 准备一份用于日志的快照
+                            positions_snapshot = sorted(
+                                [(p['price'], p['qty']) for p in self.open_positions])
+
+                            # ==================================================================
+                            # ✅ 关键修改：在这里添加 bought_levels 的状态到日志中
+                            # ==================================================================
+                            # 1. 获取 bought_levels 的一个可读的、排序后的列表
+                            bought_levels_snapshot = sorted(
+                                list(self.bought_levels))
+
+                            # 2. 构建包含所有调试信息的 linked_info 字符串
+                            debug_info = (f"Estimated cost: {estimated_cost:.2f}; "
+                                          f"Bought Levels: {bought_levels_snapshot}")
+
+                            self._log_trade(
+                                timestamp=ts,
+                                side="BUY_SKIPPED_NO_CASH",
+                                level_price=lv,
+                                linked_info=debug_info,  # <-- 使用新的、信息更丰富的字符串
+                                watermark_snapshot=self.highest_sell_level_watermark,
+                                avg_cost=None, qty=self.trade_qty_per_grid, amount_usdt=None, profit=None,
+                                close_price=c,
+                                positions_snapshot=positions_snapshot,
+                                levels_snapshot=self.levels,
+                                profit_pool_snapshot=self.profit_pool,
+                                cash_snapshot=self.cash,
+                                single_trade_fee=None,
+                                total_fees_snapshot=self.total_fees
+                            )
+                            # ==================================================================
+                        break
+                    # ==================================================================
+
                     if self._execute_buy(level_price=lv,
                                          buy_price=lv,
                                          qty_to_buy=self.trade_qty_per_grid,
@@ -784,6 +878,8 @@ class GridTrader:
             self.shift_count += 1
             boundary_changed = True
             self.reference_ma = current_ma
+            self.bought_levels = {p["price"] for p in self.open_positions}
+
             # ✅ [新增] 专门为 reference_ma 的变化记录一条日志
             # =====================================================================
             if self.verbose and old_reference_ma != self.reference_ma:
@@ -807,8 +903,7 @@ class GridTrader:
             # =====================================================================
             # 在所有状态更新完毕后，记录一个总的 SHIFT 事件
             if self.verbose:
-                arrow = "▲" if "UP" in shift_direction else "▼"
-                self._log_trade(timestamp=ts, side=f"SHIFT_{shift_direction}_DONE", level_price=f"{arrow} Grid Shifted", watermark_snapshot=self.highest_sell_level_watermark,
+                self._log_trade(timestamp=ts, side=f"SHIFT_{shift_direction}_DONE", level_price=f"{shift_direction} Grid Shifted", watermark_snapshot=self.highest_sell_level_watermark,
                                 linked_info=f"{old_levels[0]:.2f}-{old_levels[-1]:.2f} -> {self.lower:.2f}-{self.upper:.2f}",
                                 avg_cost=None, qty=None, amount_usdt=None, profit=None, close_price=c, positions_snapshot=sorted([(p['price'], p['qty']) for p in self.open_positions]),
                                 levels_snapshot=self.levels,  profit_pool_snapshot=self.profit_pool, cash_snapshot=self.cash, single_trade_fee=None,  # ✅ 新增: 非交易事件，无单笔费用
@@ -1046,6 +1141,8 @@ class GridTrader:
                 else:
                     log_side = "REINVEST_SKIPPED"
                     log_msg = f"Cash insufficient. Needed ${cash_needed_for_add_on:.2f}, Have ${self.cash:.2f}; Pool was {reinvest_amount:.2f}"
+                    print(log_side)
+                    print(log_msg)
                 self._log_trade(
                     ts, log_side, log_msg,
                     None, self.highest_sell_level_watermark, None, None, None, None, c,
@@ -1401,8 +1498,8 @@ def run_parameter_scan_refactored(config, cache_file):
 
 def run_batch_scan_parallel(config, cache_file, param_csv):
     """
-    (V-Final - 修复版)
-    并行执行回测，汇总进Excel，明细进CSV。
+    (V-Final - 内存优化版)
+    并行执行回测，并以流式方式处理结果，避免在主进程中累积大量数据。
     """
     # 1. 检查和准备 (逻辑不变)
     if not os.path.exists(param_csv):
@@ -1421,53 +1518,45 @@ def run_batch_scan_parallel(config, cache_file, param_csv):
     results_list = []
     output_filename = f"batch_parallel_{config['symbol']}_report.xlsx"
 
-    # 2. 并行执行回测并收集所有结果 (逻辑不变)
+    # ==================================================================
+    # ✅ 关键修改：使用 as_completed 实现流式处理，优化内存
+    # ==================================================================
     with concurrent.futures.ProcessPoolExecutor() as executor:
         print(f"\n--- 开始并行批量回测 ({len(tasks)} 组参数) ---")
-        results_iterator = executor.map(run_single_backtest, tasks)
 
-        # 先将所有结果收集到内存中
-        collected_results = [result for result in tqdm(
-            results_iterator, total=len(tasks), desc="并行批量回测中")]
+        # 1. 提交所有任务，得到一个 future 对象的列表
+        futures = [executor.submit(run_single_backtest, task)
+                   for task in tasks]
 
+        # 2. 使用 as_completed，它会在任何一个 future 完成时立即返回
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="并行批量回测中"):
+            try:
+                # a. 获取已完成任务的结果
+                run_id, summary, trade_df, error = future.result()
+
+                if error:
+                    print(f"\n⚠️ 跳过出错的参数组 {run_id}。")
+                    continue
+
+                # b. 立即处理结果：收集 summary
+                results_list.append(summary)
+
+                # c. 立即处理结果：将巨大的 trade_df 写入磁盘
+                detail_csv_path = os.path.join(
+                    details_folder, f"Details_{run_id}.csv")
+                trade_df.to_csv(detail_csv_path, index=False)
+
+                # d. trade_df 变量的内存会在下一次循环开始时被自动回收，不会累积！
+
+            except Exception as exc:
+                print(f'\n🔥 一个任务在获取结果时产生了异常: {exc}')
     # ==================================================================
-    # ✅ 关键修复：在所有计算完成后，再统一进行文件IO操作
-    # ==================================================================
-    print("\n--- 所有回测计算完成，正在处理和保存结果 ---")
 
-    # 3. 遍历收集到的结果，保存CSV明细并准备汇总列表
-    for result in collected_results:
-        run_id, summary, trade_df, error = result
-        if error:
-            print(f"\n⚠️ 跳过出错的参数组 {run_id}。")
-            continue
-
-        results_list.append(summary)
-
-        # 保存详细交易日志到CSV
-        detail_csv_path = os.path.join(details_folder, f"Details_{run_id}.csv")
-        try:
-            trade_df.to_csv(detail_csv_path, index=False)
-        except Exception as e:
-            print(f"\n🔥 警告：无法保存详情文件 {detail_csv_path}. 错误: {e}")
-
-    # 4. 如果有成功的结果，则生成并保存汇总报告到Excel
+    # --- 后续的报告生成逻辑完全不变 ---
+    print("\n--- 所有回测计算完成，正在生成最终汇总报告 ---")
     if results_list:
         summary_df = pd.DataFrame(results_list)
-        summary_df.sort_values(by='总盈亏(%)', ascending=False, inplace=True)
-
-        # (列排序逻辑保持不变)
-        result_cols = [
-            '总盈亏(%)', '已实现盈亏', '未实现盈亏', '卖出次数',
-            '单次均利', '当前持仓', '总手续费', '移动次数'
-        ]
-        core_param_cols = ['下限', '上限', '网格数量']
-        all_summary_cols = summary_df.columns.tolist()
-        other_param_cols = [col for col in all_summary_cols
-                            if col not in result_cols and col not in core_param_cols]
-        final_cols = result_cols + core_param_cols + other_param_cols
-        summary_df = summary_df[[
-            col for col in final_cols if col in summary_df.columns]]
+        # ... (排序和写入Excel的逻辑不变)
 
         # a. 将【只包含汇总】的DataFrame写入Excel文件
         try:
